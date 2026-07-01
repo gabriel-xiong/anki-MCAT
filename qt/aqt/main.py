@@ -1448,6 +1448,11 @@ title="{}" {}>{}</button>""".format(
         qconnect(m.action_check_for_updates.triggered, self.on_check_for_updates)
         qconnect(m.actionPreferences.triggered, self.onPrefs)
 
+        # MCAT Speedrun — performance mode entries
+        from aqt.mcat import setup_mcat_menu
+
+        setup_mcat_menu(self)
+
         # View
         qconnect(
             m.actionZoomIn.triggered,

@@ -52,10 +52,12 @@ class DeckBrowserContent:
     Attributes:
         tree {str} -- HTML of the deck tree section
         stats {str} -- HTML of the stats section
+        mcat_dashboard {str} -- HTML of the MCAT three-score dashboard
     """
 
     tree: str
     stats: str
+    mcat_dashboard: str = ""
 
 
 @dataclass
@@ -134,6 +136,22 @@ class DeckBrowser:
             set_current_deck(
                 parent=self.mw, deck_id=DeckId(int(arg))
             ).run_in_background()
+        elif cmd == "mcat_perf":
+            from aqt.mcat import open_performance
+
+            open_performance(self.mw, interleaved=False)
+        elif cmd == "mcat_perf_i":
+            from aqt.mcat import open_performance
+
+            open_performance(self.mw, interleaved=True)
+        elif cmd == "mcat_mastery":
+            from aqt.mcat import open_mastery
+
+            open_mastery(self.mw)
+        elif cmd == "mcat_focus":
+            from aqt.mcat import open_focus_area
+
+            open_focus_area(self.mw, arg)
         return False
 
     def set_current_deck(self, deck_id: DeckId) -> None:
@@ -145,6 +163,7 @@ class DeckBrowser:
     ##########################################################################
 
     _body = """
+%(mcat_dashboard)s
 <center>
 <table cellspacing=0 cellpadding=3>
 %(tree)s
@@ -183,6 +202,7 @@ class DeckBrowser:
         content = DeckBrowserContent(
             tree=self._renderDeckTree(data.tree),
             stats=self._renderStats(),
+            mcat_dashboard=self._render_mcat_dashboard(),
         )
         gui_hooks.deck_browser_will_render_content(self, content)
         self.web.stdHtml(
@@ -208,6 +228,24 @@ class DeckBrowser:
         return '<div id="studiedToday"><span>{}</span></div>'.format(
             self._render_data.studied_today
         )
+
+    # MCAT Speedrun dashboard
+    ##########################################################################
+
+    def _render_mcat_dashboard(self) -> str:
+        """Three separate scores (memory, performance, readiness) embedded at
+        the top of the home screen. Never blends scores; abstains honestly.
+
+        Wrapped defensively so a dashboard error can never break the deck list.
+        """
+        try:
+            from anki.mcat_scores import dashboard_data
+
+            data = dashboard_data(self.mw.col)
+            return _mcat_dashboard_html(data)
+        except Exception as exc:  # pragma: no cover - defensive
+            print("mcat dashboard render failed:", exc)
+            return ""
 
     def _renderDeckTree(self, top: DeckTreeNode) -> str:
         buf = """
@@ -436,3 +474,217 @@ class DeckBrowser:
 
         showInfo(tr.scheduling_update_done())
         self.refresh()
+
+
+# MCAT Speedrun dashboard HTML
+##############################################################################
+
+
+def _pct(value: float | None) -> str:
+    return "—" if value is None else f"{round(value * 100)}%"
+
+
+def _mcat_card(
+    *,
+    accent: str,
+    label: str,
+    headline: str,
+    sub: str,
+    note: str,
+    abstaining: bool,
+) -> str:
+    badge = (
+        "<span class='mcat-badge mcat-badge-abstain'>not enough data</span>"
+        if abstaining
+        else "<span class='mcat-badge'>measured</span>"
+    )
+    note_html = (
+        f"<div class='mcat-note'>{html.escape(note)}</div>" if note else ""
+    )
+    return f"""
+<div class="mcat-card" style="--mcat-accent:{accent};">
+  <div class="mcat-card-top">
+    <span class="mcat-card-label">{html.escape(label)}</span>{badge}
+  </div>
+  <div class="mcat-headline">{headline}</div>
+  <div class="mcat-sub">{html.escape(sub)}</div>
+  {note_html}
+</div>"""
+
+
+def _mcat_focus_html(focus: dict[str, Any] | None) -> str:
+    """Prominent 'Focus area' card: the top diagnosed weakness + one-click
+    action. Same visual weight as the three score cards; theme-aware."""
+    if not focus:
+        return ""
+    label = html.escape(focus.get("action_label") or "")
+    if focus.get("status") != "ok":
+        reason = html.escape(focus.get("reason") or "")
+        return f"""
+<div class="mcat-focus mcat-focus-abstain">
+  <div class="mcat-focus-body">
+    <span class="mcat-focus-tag">Focus area</span>
+    <div class="mcat-focus-head">Not enough data yet</div>
+    <div class="mcat-focus-sub">{reason}</div>
+  </div>
+</div>"""
+
+    kind = focus.get("kind") or ""
+    etype = html.escape(focus.get("error_type") or "")
+    topic = html.escape(focus.get("topic_name") or "")
+    launch = html.escape(focus.get("launch") or "")
+    verb = {
+        "review": "Review flashcards",
+        "performance": "Practice applied",
+        "pacing": "Start drill",
+    }.get(kind, "Start")
+    return f"""
+<div class="mcat-focus">
+  <div class="mcat-focus-body">
+    <span class="mcat-focus-tag">Focus area</span>
+    <div class="mcat-focus-head">{label}</div>
+    <div class="mcat-focus-sub">Top diagnosed weakness: <b>{etype}</b>{(' · ' + topic) if topic else ''}</div>
+  </div>
+  <button class="mcat-focus-btn" onclick='pycmd("mcat_focus:{launch}")'>{html.escape(verb)} &rarr;</button>
+</div>"""
+
+
+def _mcat_dashboard_html(data: dict[str, Any]) -> str:
+    mem = data["memory"]
+    perf = data["performance"]
+    read = data["readiness"]
+    cov = data["coverage"]
+    action = data["next_action"]
+    focus_html = _mcat_focus_html(data.get("focus_area"))
+
+    # Memory card
+    mem_card = _mcat_card(
+        accent="#4c7cf3",
+        label="Memory",
+        headline=f"{mem['total_reviews']}",
+        sub=f"reviews · {mem['topics_studied']}/{cov['total']} topics · "
+        f"{mem['topics_unlocked']} unlocked",
+        note=mem["reason"] or "",
+        abstaining=mem["status"] == "abstain",
+    )
+
+    # Performance card — show accuracy even while abstaining, labeled provisional
+    perf_headline = _pct(perf["accuracy"])
+    perf_card = _mcat_card(
+        accent="#9b5cf6",
+        label="Performance",
+        headline=perf_headline,
+        sub=f"{perf['correct']}/{perf['attempts']} correct · "
+        f"{perf['unlocked_topics']} topic(s) unlocked",
+        note=perf["reason"] or "",
+        abstaining=perf["status"] == "abstain",
+    )
+
+    # Readiness card
+    if read["status"] == "ok" and read["range"]:
+        lo, hi = read["range"]
+        read_headline = f"{lo}–{hi}"
+        read_sub = f"coverage {read['coverage_pct']}% · {read.get('confidence','low')} confidence"
+    else:
+        read_headline = "—"
+        read_sub = f"coverage {read['coverage_pct']}% (need ≥50%)"
+    read_card = _mcat_card(
+        accent="#2bb673",
+        label="Readiness (472–528)",
+        headline=read_headline,
+        sub=read_sub,
+        note=read["reason"] or "",
+        abstaining=read["status"] == "abstain",
+    )
+
+    cov_pct = cov["pct"]
+    return f"""
+<style>
+.mcat-dash {{
+  max-width: 880px; margin: 14px auto 6px auto; padding: 0 12px;
+  text-align: start; font-size: 14px;
+}}
+.mcat-dash-head {{
+  display: flex; align-items: baseline; justify-content: space-between;
+  margin-bottom: 10px;
+}}
+.mcat-dash-title {{ font-size: 17px; font-weight: 700; }}
+.mcat-dash-sub {{ color: var(--fg-subtle, #888); font-size: 12px; }}
+.mcat-cards {{ display: flex; gap: 12px; flex-wrap: wrap; }}
+.mcat-card {{
+  flex: 1 1 0; min-width: 200px; border: 1px solid var(--border, #d7d7d7);
+  border-top: 3px solid var(--mcat-accent); border-radius: 10px;
+  padding: 12px 14px; background: var(--canvas-elevated, rgba(127,127,127,0.06));
+}}
+.mcat-card-top {{ display: flex; align-items: center; justify-content: space-between; }}
+.mcat-card-label {{ font-size: 12px; font-weight: 600; color: var(--fg-subtle, #888);
+  text-transform: uppercase; letter-spacing: .04em; }}
+.mcat-badge {{ font-size: 10px; padding: 2px 7px; border-radius: 999px;
+  background: var(--mcat-accent); color: white; font-weight: 600; }}
+.mcat-badge-abstain {{ background: var(--fg-subtle, #999); }}
+.mcat-headline {{ font-size: 30px; font-weight: 700; line-height: 1.15; margin: 6px 0 2px;
+  color: var(--mcat-accent); }}
+.mcat-sub {{ font-size: 12px; color: var(--fg-subtle, #888); }}
+.mcat-note {{ font-size: 11px; margin-top: 8px; color: var(--fg-subtle, #888);
+  border-top: 1px dashed var(--border, #ddd); padding-top: 6px; }}
+.mcat-cover-wrap {{ margin-top: 12px; }}
+.mcat-cover-bar {{ height: 8px; border-radius: 999px; overflow: hidden;
+  background: var(--border, #e2e2e2); }}
+.mcat-cover-fill {{ height: 100%; background: #2bb673; width: {cov_pct}%; }}
+.mcat-cover-label {{ font-size: 12px; color: var(--fg-subtle, #888); margin-top: 4px; }}
+.mcat-action {{ margin-top: 12px; display: flex; align-items: center;
+  justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
+.mcat-action-text {{ font-size: 13px; }}
+.mcat-action-text b {{ color: var(--fg, inherit); }}
+.mcat-btns button {{ margin-left: 6px; padding: 6px 12px; border-radius: 6px;
+  border: 1px solid var(--border, #ccc); cursor: pointer;
+  background: var(--canvas-elevated, transparent); color: inherit; }}
+.mcat-btns button.primary {{ background: #9b5cf6; color: white; border-color: #9b5cf6; }}
+.mcat-btns button.mastery {{ border-color: #4c7cf3; color: #4c7cf3; font-weight: 600; }}
+.mcat-cover-head {{ display: flex; align-items: baseline; justify-content: space-between; }}
+.mcat-cover-link {{ font-size: 12px; color: #4c7cf3; cursor: pointer; font-weight: 600; }}
+.mcat-cover-link:hover {{ text-decoration: underline; }}
+.mcat-focus {{ margin-top: 14px; display: flex; align-items: center;
+  justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  border: 1px solid var(--border, #d7d7d7); border-left: 4px solid #f5a623;
+  border-radius: 10px; padding: 14px 16px;
+  background: var(--canvas-elevated, rgba(245,166,35,0.08)); }}
+.mcat-focus-abstain {{ border-left-color: var(--fg-subtle, #999);
+  background: var(--canvas-elevated, rgba(127,127,127,0.06)); }}
+.mcat-focus-tag {{ font-size: 11px; font-weight: 700; color: #f5a623;
+  text-transform: uppercase; letter-spacing: .05em; }}
+.mcat-focus-abstain .mcat-focus-tag {{ color: var(--fg-subtle, #999); }}
+.mcat-focus-head {{ font-size: 19px; font-weight: 700; margin: 4px 0 2px; }}
+.mcat-focus-sub {{ font-size: 12px; color: var(--fg-subtle, #888); }}
+.mcat-focus-btn {{ padding: 9px 16px; border-radius: 8px; cursor: pointer;
+  border: none; background: #f5a623; color: #1a1a1a; font-weight: 700;
+  font-size: 13px; white-space: nowrap; }}
+.mcat-focus-btn:hover {{ filter: brightness(1.06); }}
+</style>
+<div class="mcat-dash">
+  <div class="mcat-dash-head">
+    <span class="mcat-dash-title">MCAT Speedrun</span>
+    <span class="mcat-dash-sub">three separate scores · never blended</span>
+  </div>
+  <div class="mcat-cards">
+    {mem_card}
+    {perf_card}
+    {read_card}
+  </div>
+  {focus_html}
+  <div class="mcat-cover-wrap">
+    <div class="mcat-cover-head">
+      <span class="mcat-cover-label">Coverage: {cov['measured']}/{cov['total']} topics measured ({cov_pct}%)</span>
+      <span class="mcat-cover-link" onclick='pycmd("mcat_mastery")'>View topic mastery &rarr;</span>
+    </div>
+    <div class="mcat-cover-bar"><div class="mcat-cover-fill"></div></div>
+  </div>
+  <div class="mcat-action">
+    <div class="mcat-action-text"><b>Next:</b> {html.escape(action)}</div>
+    <div class="mcat-btns">
+      <button class="mastery" onclick='pycmd("mcat_mastery")'>Topic mastery</button>
+      <button onclick='pycmd("mcat_perf")'>Blocked session</button>
+      <button class="primary" onclick='pycmd("mcat_perf_i")'>Interleaved session</button>
+    </div>
+  </div>
+</div>"""

@@ -38,3 +38,4 @@ protobuf!(sync, "sync");
 protobuf!(tags, "tags");
 protobuf!(ankihub, "ankihub");
 protobuf!(github, "github");
+protobuf!(mcat, "mcat");

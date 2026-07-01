@@ -21,6 +21,7 @@ from anki import (
     search_pb2,
     stats_pb2,
     sync_pb2,
+    mcat_pb2,
 )
 from anki._legacy import DeprecatedNamesMixin, deprecated
 from anki.sync_pb2 import SyncLoginRequest
@@ -1027,6 +1028,13 @@ class Collection(DeprecatedNamesMixin):
 
     def studied_today(self) -> str:
         return self._backend.studied_today()
+
+    def get_topic_mastery(self) -> Sequence[mcat_pb2.TopicMastery]:
+        """Per-topic memory stats for MCAT performance eligibility (read-only)."""
+        return self._backend.get_topic_mastery()
+
+    def get_topic_mastery_one(self, topic_id: str) -> mcat_pb2.TopicMastery:
+        return self._backend.get_topic_mastery_one(topic_id)
 
     # Undo
     ##########################################################################

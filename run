@@ -16,5 +16,11 @@ export PYENV=${PYENV-out/pyenv}
 export ANKI_API_PORT=${ANKI_API_PORT-40000}
 export ANKI_API_HOST=${ANKI_API_HOST-127.0.0.1}
 
+if [[ "${OSTYPE:-}" == "msys" || "${OSTYPE:-}" == "cygwin" ]]; then
+  PYTHON="${PYENV}/Scripts/python.exe"
+else
+  PYTHON="${PYENV}/bin/python"
+fi
+
 ./ninja pylib qt
-${PYENV}/bin/python tools/run.py $*
+"$PYTHON" tools/run.py $*
