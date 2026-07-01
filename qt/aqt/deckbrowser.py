@@ -404,6 +404,13 @@ class DeckBrowser:
         deck = self.mw.col.decks.find_deck_in_tree(self._render_data.tree, did)
         assert deck is not None
         deck_name = deck.name
+        # MCAT Speedrun: if this deck holds MCAT cards, clear the sidecar
+        # performance/readiness data now — before the async removal — so the
+        # post-delete re-render shows the honest "not enough data" state rather
+        # than stale numbers. No-op for ordinary (non-MCAT) deck deletions.
+        from aqt.mcat import reset_performance_on_deck_delete
+
+        reset_performance_on_deck_delete(self.mw, did)
         remove_decks(
             parent=self.mw, deck_ids=[did], deck_name=deck_name
         ).run_in_background()

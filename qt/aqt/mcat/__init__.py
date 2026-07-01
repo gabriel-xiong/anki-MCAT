@@ -10,14 +10,16 @@ gated by the Rust mastery query; CARS bypasses the gate.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from anki import mcat_perf
 from anki.mcat_perf import PerfStore, unlocked_topic_ids
 from aqt.qt import QAction, qconnect
-from aqt.utils import getFile, showInfo, tooltip
+from aqt.utils import askUser, getFile, getSaveFile, showInfo, tooltip
 
 if TYPE_CHECKING:
+    from anki.decks import DeckId
     from aqt.main import AnkiQt
 
 
@@ -42,6 +44,14 @@ def setup_mcat_menu(mw: AnkiQt) -> None:
     qconnect(act_load.triggered, lambda: load_question_bank(mw))
     menu.addAction(act_load)
 
+    act_export = QAction("MCAT: Export performance data…", mw)
+    qconnect(act_export.triggered, lambda: export_performance_data(mw))
+    menu.addAction(act_export)
+
+    act_reset = QAction("MCAT: Reset performance data…", mw)
+    qconnect(act_reset.triggered, lambda: reset_performance_data(mw))
+    menu.addAction(act_reset)
+
 
 def open_mastery(mw: AnkiQt) -> None:
     if not mw.col:
@@ -65,6 +75,149 @@ def load_question_bank(mw: AnkiQt) -> None:
         tooltip(f"Loaded {n} questions into the performance bank.", parent=mw)
 
     getFile(mw, "Load MCAT question bank (questions.json)", on_file, filter="*.json")
+
+
+def export_performance_data(mw: AnkiQt) -> None:
+    """Export the current collection's performance attempts for offline eval.
+
+    Resolves the sidecar DB path next to the collection, asks where to save, and
+    writes an export (format inferred from the chosen extension; anything other
+    than .csv/.json writes both). Read-only on the sidecar DB.
+    """
+    if not mw.col:
+        return
+    db = mcat_perf.sidecar_path(mw.col)
+    if not os.path.exists(db):
+        showInfo(
+            "No performance data yet.\n\n"
+            "Run a performance session first "
+            "(Tools → 'MCAT: Performance session').",
+            parent=mw,
+            title="MCAT Export",
+        )
+        return
+
+    default = os.path.splitext(db)[0] + ".perf_export.csv"
+    path = getSaveFile(
+        mw,
+        "Export MCAT performance data",
+        "mcat_perf_export",
+        "Performance export",
+        ".csv",
+        os.path.basename(default),
+    )
+    if not path:
+        return
+
+    ext = os.path.splitext(path)[1].lower()
+    fmt = "csv" if ext == ".csv" else "json" if ext == ".json" else "both"
+    try:
+        n = mcat_perf.export_attempts(db, path, fmt=fmt)
+    except Exception as exc:
+        showInfo(f"Export failed: {exc}", parent=mw, title="MCAT Export")
+        return
+    tooltip(f"Exported {n} performance attempts → {path}", parent=mw)
+
+
+def reset_performance_data(mw: AnkiQt) -> None:
+    """Delete all recorded performance attempts for the current collection.
+
+    Testing / fresh-start helper. Clears ``perf_attempts`` (which resets the
+    performance & readiness scores) but leaves the loaded question bank
+    (``perf_questions``) intact so it does not need reloading. Confirmation
+    defaults to No.
+    """
+    if not mw.col:
+        return
+    db = mcat_perf.sidecar_path(mw.col)
+    if not os.path.exists(db):
+        showInfo(
+            "No performance data yet — nothing to reset.",
+            parent=mw,
+            title="MCAT Reset",
+        )
+        return
+
+    if not askUser(
+        "Reset all recorded performance attempts?\n\n"
+        "This permanently clears every logged attempt and resets your "
+        "performance and readiness scores. The loaded question bank is kept.\n\n"
+        "This cannot be undone.",
+        parent=mw,
+        defaultno=True,
+        title="MCAT Reset performance data",
+    ):
+        return
+
+    store = PerfStore(mw.col)
+    try:
+        n = store.reset_attempts()
+    finally:
+        store.close()
+    tooltip(f"Cleared {n} performance attempts.", parent=mw)
+
+
+def deck_holds_mcat_cards(mw: AnkiQt, did: DeckId) -> bool:
+    """True if a deck (including its subdecks) contains MCAT cards.
+
+    MCAT content is identified by ``topic:<id>`` note tags — mastery and
+    performance eligibility are tag-based, not deck-based, so there is no fixed
+    "MCAT deck". We detect membership by intersecting the deck's card ids with
+    the topic-tagged card ids. Best-effort: any backend hiccup returns ``False``
+    so ordinary, non-MCAT deck deletions are never affected. Must be called
+    BEFORE the deck is removed, while its cards still exist.
+    """
+    col = mw.col
+    if not col:
+        return False
+    try:
+        deck_cids = set(col.decks.cids(did, children=True))
+        if not deck_cids:
+            return False
+        mcat_cids = set(col.find_cards("tag:topic:*"))
+        return not deck_cids.isdisjoint(mcat_cids)
+    except Exception:
+        return False
+
+
+def reset_performance_on_deck_delete(mw: AnkiQt, did: DeckId) -> None:
+    """Clear MCAT performance attempts when an MCAT deck is deleted.
+
+    Deleting a deck resets the memory/mastery scores automatically (they derive
+    from the now-deleted cards), but Performance and Readiness live in the
+    independent sidecar DB (``mcat_perf.db``) and would otherwise keep showing
+    stale numbers (e.g. "8/29 correct · 28%"). This clears the recorded attempts
+    — NOT the loaded question bank — which is exactly what drives the dashboard
+    counts, so it returns to its honest "not enough data" state once the
+    deck-browser re-renders.
+
+    Scope decision (MCAT-deck-only): performance questions are keyed by topic in
+    the sidecar, not tied to a specific Anki deck, so there is no clean
+    deck→question mapping. We therefore only fire when the deleted deck actually
+    held MCAT-tagged cards — deleting an unrelated deck never wipes performance
+    data. Safe no-op when there is no sidecar DB yet or nothing to reset.
+
+    Call this BEFORE scheduling the (async) removal so the post-delete re-render
+    reflects the already-cleared sidecar. Deck deletion is undoable; the perf
+    reset is not, so an undo restores the cards but leaves attempts cleared —
+    an acceptable trade-off for the "clean slate" intent.
+    """
+    if not mw.col:
+        return
+    if not deck_holds_mcat_cards(mw, did):
+        return
+    db = mcat_perf.sidecar_path(mw.col)
+    if not os.path.exists(db):
+        return
+    try:
+        store = PerfStore(mw.col)
+        try:
+            store.reset_attempts()
+        finally:
+            store.close()
+    except Exception:
+        # A sidecar hiccup must never break deck deletion.
+        pass
 
 
 def open_performance(

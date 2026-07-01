@@ -20,6 +20,14 @@ body {
     background-repeat: no-repeat;
     background-position: top;
     background-attachment: fixed;
+    // Vertically center the card content in the reviewer webview instead of
+    // pinning it to the top. `safe center` keeps long cards fully visible
+    // (they anchor to the top and scroll normally rather than overflowing off
+    // the top edge). Horizontal alignment is left to the notetype styling.
+    min-height: calc(100vh - 40px);
+    display: flex;
+    flex-direction: column;
+    justify-content: safe center;
 }
 
 // explicit nightMode definition required
