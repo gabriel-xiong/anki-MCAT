@@ -44,9 +44,21 @@ def setup_mcat_menu(mw: AnkiQt) -> None:
     qconnect(act_load.triggered, lambda: load_question_bank(mw))
     menu.addAction(act_load)
 
+    act_load_pool = QAction("MCAT: Load application-practice pool…", mw)
+    qconnect(act_load_pool.triggered, lambda: load_remediation_pool(mw))
+    menu.addAction(act_load_pool)
+
     act_export = QAction("MCAT: Export performance data…", mw)
     qconnect(act_export.triggered, lambda: export_performance_data(mw))
     menu.addAction(act_export)
+
+    act_export_bundle = QAction("MCAT: Export sync bundle…", mw)
+    qconnect(act_export_bundle.triggered, lambda: export_performance_bundle(mw))
+    menu.addAction(act_export_bundle)
+
+    act_import_bundle = QAction("MCAT: Import sync bundle…", mw)
+    qconnect(act_import_bundle.triggered, lambda: import_performance_data(mw))
+    menu.addAction(act_import_bundle)
 
     act_reset = QAction("MCAT: Reset performance data…", mw)
     qconnect(act_reset.triggered, lambda: reset_performance_data(mw))
@@ -75,6 +87,43 @@ def load_question_bank(mw: AnkiQt) -> None:
         tooltip(f"Loaded {n} questions into the performance bank.", parent=mw)
 
     getFile(mw, "Load MCAT question bank (questions.json)", on_file, filter="*.json")
+
+
+def load_remediation_pool(mw: AnkiQt) -> None:
+    """Load the application-practice remediation pool into its ISOLATED store.
+
+    Parallel to ``load_question_bank`` but targets ``remediation_items`` (never
+    ``perf_questions``): these items back the ``application`` next-action's short
+    practice set and must NEVER enter the Performance/Readiness scores. Pick
+    ``data/application-practice.json``. See MCAT/docs/APPLICATION-PRACTICE-POOL.md.
+    """
+    if not mw.col:
+        return
+
+    def on_file(path: str) -> None:
+        store = PerfStore(mw.col)
+        try:
+            n = store.load_remediation(path)
+        except Exception as exc:
+            showInfo(
+                f"Could not load application-practice pool: {exc}",
+                parent=mw,
+                title="MCAT",
+            )
+            return
+        finally:
+            store.close()
+        tooltip(
+            f"Loaded {n} application-practice items (isolated, not scored).",
+            parent=mw,
+        )
+
+    getFile(
+        mw,
+        "Load MCAT application-practice pool (application-practice.json)",
+        on_file,
+        filter="*.json",
+    )
 
 
 def export_performance_data(mw: AnkiQt) -> None:
@@ -117,6 +166,89 @@ def export_performance_data(mw: AnkiQt) -> None:
         showInfo(f"Export failed: {exc}", parent=mw, title="MCAT Export")
         return
     tooltip(f"Exported {n} performance attempts → {path}", parent=mw)
+
+
+def export_performance_bundle(mw: AnkiQt) -> None:
+    """Write a portable, versioned sync bundle of this collection's perf data.
+
+    Two-way sync (Friday): the bundle carries the append-only ``perf_attempts``
+    (each with a stable ``uuid``) plus the question bank, so another device can
+    UNION-MERGE it via 'MCAT: Import sync bundle…'. This is separate from the
+    eval CSV/JSON export above — a bundle is the importable interchange format.
+    No AI, no network.
+    """
+    if not mw.col:
+        return
+    db = mcat_perf.sidecar_path(mw.col)
+    if not os.path.exists(db):
+        showInfo(
+            "No performance data yet.\n\n"
+            "Run a performance session first "
+            "(Tools → 'MCAT: Performance session').",
+            parent=mw,
+            title="MCAT Sync",
+        )
+        return
+
+    default = os.path.splitext(db)[0] + ".perf_bundle.json"
+    path = getSaveFile(
+        mw,
+        "Export MCAT sync bundle",
+        "mcat_perf_bundle",
+        "MCAT sync bundle",
+        ".json",
+        os.path.basename(default),
+    )
+    if not path:
+        return
+    if not path.lower().endswith(".json"):
+        path += ".json"
+
+    try:
+        res = mcat_perf.export_bundle(db, path)
+    except Exception as exc:
+        showInfo(f"Export failed: {exc}", parent=mw, title="MCAT Sync")
+        return
+    tooltip(
+        f"Exported sync bundle ({res['attempts']} attempts, "
+        f"{res['questions']} questions) → {path}",
+        parent=mw,
+    )
+
+
+def import_performance_data(mw: AnkiQt) -> None:
+    """Merge a sync bundle from another device into this collection's perf data.
+
+    Two-way sync (Friday): append-only UNION merge — attempts are deduped by
+    their stable ``uuid`` so re-importing the same bundle is a no-op, and the
+    merge is order-independent. After each device imports the other's bundle,
+    both converge to the union of all attempts. No AI, no network.
+    """
+    if not mw.col:
+        return
+
+    def on_file(path: str) -> None:
+        store = PerfStore(mw.col)
+        try:
+            res = store.import_bundle(path)
+        except Exception as exc:
+            showInfo(f"Import failed: {exc}", parent=mw, title="MCAT Sync")
+            return
+        finally:
+            store.close()
+        tooltip(
+            f"Imported {res['attempts_added']} new attempts "
+            f"({res['attempts_skipped']} already present; "
+            f"{res['questions_added']} questions added).",
+            parent=mw,
+        )
+
+    getFile(
+        mw,
+        "Import MCAT sync bundle (JSON)",
+        on_file,
+        filter="*.json",
+    )
 
 
 def reset_performance_data(mw: AnkiQt) -> None:

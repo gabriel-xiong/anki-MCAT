@@ -5,9 +5,13 @@
 
 Presents one eligible MCQ at a time, grades it, and on a miss shows a
 confidence-gated diagnosis panel driven by the session's v2 inference
-(``content_gap`` / ``application`` / ``misread``). The user either one-tap
-confirms the inferred hypothesis or expands the frozen self-report enum to
-override it; low-confidence misses fall back to the raw self-report buttons.
+(``content_gap`` / ``application`` / ``misread``). On a SCIENCE miss with a
+resolvable backing sub-concept, an **immediate content re-check probe** runs
+FIRST (plain recall of the backing card → reveal → "I knew it" / "I didn't"),
+and its objective outcome informs the diagnosis before it is shown. The user
+either one-tap confirms the inferred hypothesis or expands the frozen self-report
+enum to override it; low-confidence misses fall back to the raw self-report
+buttons.
 Every attempt is logged to the sidecar perf DB via the session's existing
 ``classify_error`` path (which records ``error_source`` = inferred_confirmed /
 self_report_override / self_report). Performance accuracy is shown at the end
@@ -40,7 +44,7 @@ from aqt.qt import (
     QVBoxLayout,
     qconnect,
 )
-from aqt.utils import disable_help_button, restoreGeom, saveGeom
+from aqt.utils import disable_help_button, restoreGeom, saveGeom, tooltip
 
 if TYPE_CHECKING:
     from aqt.main import AnkiQt
@@ -84,6 +88,11 @@ class PerformanceDialog(QDialog):
         # internals). The inferred type awaiting a Confirm tap.
         self._chosen_idx: Optional[int] = None
         self._inferred_type: Optional[str] = None
+        # Selected application-practice items awaiting a launch (current miss).
+        self._practice_items: list[dict[str, Any]] = []
+        # Resolved content re-check probe target for the current miss (or None
+        # when the probe is skipped: correct answer, CARS, unmapped).
+        self._probe_target: Optional[dict[str, Any]] = None
 
         mode = "Interleaved" if interleaved else "Blocked"
         self.setWindowTitle(f"MCAT Performance — {mode}")
@@ -130,6 +139,66 @@ class PerformanceDialog(QDialog):
         self.feedback.setWordWrap(True)
         self.feedback.setStyleSheet("margin-top: 8px;")
         root.addWidget(self.feedback)
+
+        # --- content re-check probe (immediate variant) --------------------
+        # Fires right after a SCIENCE miss, BEFORE the explanation/diagnosis:
+        # a plain recall probe of the backing sub-concept → objective content
+        # oracle. See MCAT/docs/ERROR-DIAGNOSIS-SPEC.md ("Content re-check probe").
+        self.probe_prompt = QLabel()
+        self.probe_prompt.setWordWrap(True)
+        self.probe_prompt.setTextFormat(Qt.TextFormat.RichText)
+        self.probe_prompt.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.probe_prompt.setStyleSheet(
+            "background: #eef6ff; border: 1px solid #b6d8ff; border-radius: 6px; "
+            "padding: 8px; margin-top: 8px; font-size: 14px;"
+        )
+        self.probe_prompt.setVisible(False)
+        root.addWidget(self.probe_prompt)
+
+        self.probe_answer = QLabel()
+        self.probe_answer.setWordWrap(True)
+        self.probe_answer.setTextFormat(Qt.TextFormat.RichText)
+        self.probe_answer.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.probe_answer.setStyleSheet(
+            "border-left: 3px solid #b6d8ff; padding: 4px 8px; "
+            "margin: 2px 0 4px 4px; color: #24292f; font-size: 13px;"
+        )
+        self.probe_answer.setVisible(False)
+        root.addWidget(self.probe_answer)
+
+        self.probe_row = QHBoxLayout()
+        self.probe_reveal_button = QPushButton("Reveal answer")
+        qconnect(self.probe_reveal_button.clicked, self._on_probe_reveal)
+        self.probe_row.addWidget(self.probe_reveal_button)
+        self.probe_knew_button = QPushButton("I knew it")
+        qconnect(self.probe_knew_button.clicked, lambda: self._on_probe_grade(True))
+        self.probe_row.addWidget(self.probe_knew_button)
+        self.probe_missed_button = QPushButton("I didn't")
+        qconnect(
+            self.probe_missed_button.clicked, lambda: self._on_probe_grade(False)
+        )
+        self.probe_row.addWidget(self.probe_missed_button)
+        self.probe_row.addStretch()
+        root.addLayout(self.probe_row)
+
+        # Static (NO-AI) correct-answer explanation, shown after answering (both
+        # on a correct answer and a miss). Source-grounded prose stored on the
+        # question; this is also the app's AI-off fallback rationale.
+        self.explanation_label = QLabel()
+        self.explanation_label.setWordWrap(True)
+        self.explanation_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.explanation_label.setStyleSheet(
+            "background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; "
+            "padding: 8px; margin-top: 8px; font-size: 13px;"
+        )
+        self.explanation_label.setVisible(False)
+        root.addWidget(self.explanation_label)
 
         # --- v2 diagnosis panel (hidden until a confident miss) -------------
         # Inferred hypothesis + confidence, e.g. "Looks like: Applied reasoning · 72%".
@@ -182,6 +251,30 @@ class PerformanceDialog(QDialog):
             self.error_buttons.append(b)
             self.error_button_ids.append(err_id)
 
+        # --- application next-action panel (targeted practice) --------------
+        # Shown only when the RESOLVED diagnosis is `application`: the fix for an
+        # applied-reasoning miss is targeted practice on similar integration
+        # items (NOT a flashcard). When the isolated remediation pool yields
+        # items, we surface a concrete, launchable practice set; otherwise we
+        # degrade to the generic message. See MCAT/docs/ERROR-DIAGNOSIS-SPEC.md
+        # ("Two-channel remediation routing").
+        self.next_action_label = QLabel()
+        self.next_action_label.setWordWrap(True)
+        self.next_action_label.setStyleSheet(
+            "background: #eaf5ea; border: 1px solid #b6d8b6; border-radius: 6px; "
+            "padding: 8px; margin-top: 8px; font-size: 13px; color: #1a5a1a;"
+        )
+        self.next_action_label.setVisible(False)
+        root.addWidget(self.next_action_label)
+
+        self.practice_row = QHBoxLayout()
+        self.practice_button = QPushButton()
+        qconnect(self.practice_button.clicked, self._on_launch_practice)
+        self.practice_row.addWidget(self.practice_button)
+        self.practice_row.addStretch()
+        root.addLayout(self.practice_row)
+        self.practice_button.setVisible(False)
+
         root.addStretch()
 
         line = QFrame()
@@ -221,13 +314,29 @@ class PerformanceDialog(QDialog):
         for b, err_id in zip(self.error_buttons, self.error_button_ids):
             b.setVisible(visible and err_id != exclude)
 
+    def _hide_probe(self) -> None:
+        """Hide the whole re-check probe UI."""
+        self.probe_prompt.setVisible(False)
+        self.probe_answer.setVisible(False)
+        self.probe_reveal_button.setVisible(False)
+        self.probe_knew_button.setVisible(False)
+        self.probe_missed_button.setVisible(False)
+
     def _hide_diagnosis(self) -> None:
         """Hide the whole miss UI (correct answers, new question, resolved)."""
+        self._hide_probe()
         self.diag_label.setVisible(False)
         self.misconception_label.setVisible(False)
         self.confirm_button.setVisible(False)
         self.override_toggle.setVisible(False)
         self._set_self_report_visible(False)
+        self._hide_next_action()
+
+    def _hide_next_action(self) -> None:
+        """Hide the application next-action panel + clear any pending set."""
+        self.next_action_label.setVisible(False)
+        self.practice_button.setVisible(False)
+        self._practice_items = []
 
     def _show_question(self) -> None:
         q = self.session.current
@@ -252,9 +361,11 @@ class PerformanceDialog(QDialog):
             self.choice_buttons.append(b)
 
         self.feedback.setText("")
+        self.explanation_label.setVisible(False)
         self._hide_diagnosis()
         self._chosen_idx = None
         self._inferred_type = None
+        self._probe_target = None
         self.next_button.setEnabled(False)
         self._update_score_label()
 
@@ -280,8 +391,82 @@ class PerformanceDialog(QDialog):
                 f"{q['choices'][correct_idx]}"
             )
             self.feedback.setStyleSheet("color: #cf222e; font-weight: bold;")
-            self._show_diagnosis()  # must classify before Next
+            # Immediate content re-check probe FIRST (before explanation +
+            # diagnosis) when a backing sub-concept is resolvable; otherwise fall
+            # straight through to the diagnosis path unchanged.
+            self._probe_target = self.session.probe_target()
+            if self._probe_target is not None:
+                self._start_probe()
+            else:
+                self._show_diagnosis()  # must classify before Next
+                self._show_explanation()
+        if correct:
+            self._show_explanation()
         self._update_score_label()
+
+    def _show_explanation(self) -> None:
+        """Reveal the static correct-answer explanation for the current item.
+
+        Shown after answering (correct or miss). No-op when the question carries
+        no stored explanation (legacy rows), keeping the panel hidden.
+        """
+        text = (self.session.current.get("explanation") or "").strip()
+        if not text:
+            self.explanation_label.setVisible(False)
+            return
+        self.explanation_label.setText(f"Why: {text}")
+        self.explanation_label.setVisible(True)
+
+    # Content re-check probe ------------------------------------------------
+
+    def _start_probe(self) -> None:
+        """Show the immediate recall probe for the current miss.
+
+        Sequenced BEFORE the explanation + diagnosis: the student first tries to
+        recall the backing sub-concept, then reveals and self-grades, and only
+        then do we surface the (now probe-informed) diagnosis + explanation.
+        """
+        target = self._probe_target or {}
+        self.probe_prompt.setText(
+            "Quick check — before the explanation: "
+            f"<br>{target.get('front') or ''}"
+        )
+        self.probe_prompt.setVisible(True)
+        self.probe_answer.setVisible(False)
+        self.probe_reveal_button.setVisible(True)
+        self.probe_knew_button.setVisible(False)
+        self.probe_missed_button.setVisible(False)
+        # Diagnosis + explanation stay hidden until the probe is graded.
+        self.diag_label.setVisible(False)
+        self.misconception_label.setVisible(False)
+        self.confirm_button.setVisible(False)
+        self.override_toggle.setVisible(False)
+        self._set_self_report_visible(False)
+        self.explanation_label.setVisible(False)
+        self.next_button.setEnabled(False)
+
+    def _on_probe_reveal(self) -> None:
+        if not self.session.awaiting_error_type:
+            return
+        back = (self._probe_target or {}).get("back") or ""
+        if back.strip():
+            self.probe_answer.setText(back)
+            self.probe_answer.setVisible(True)
+        self.probe_reveal_button.setVisible(False)
+        self.probe_knew_button.setVisible(True)
+        self.probe_missed_button.setVisible(True)
+
+    def _on_probe_grade(self, knew_it: bool) -> None:
+        if not self.session.awaiting_error_type:
+            return
+        # Record the objective probe outcome + re-run the (now probe-informed)
+        # inference, then reveal the diagnosis and the static "Why" explanation.
+        self.session.record_probe_outcome(
+            knew_it, card_id=(self._probe_target or {}).get("card_id")
+        )
+        self._hide_probe()
+        self._show_diagnosis()
+        self._show_explanation()
 
     # Diagnosis panel -------------------------------------------------------
 
@@ -367,8 +552,10 @@ class PerformanceDialog(QDialog):
             return
         # Confirming the inferred type → classify_error reconciles it as
         # ``inferred_confirmed`` (self_report matches the inference).
-        self.session.classify_error(self._inferred_type)
+        resolved = self._inferred_type
+        self.session.classify_error(resolved)
         self._hide_diagnosis()
+        self._present_next_action(resolved)
         self.next_button.setEnabled(True)
         self._update_score_label()
 
@@ -380,8 +567,69 @@ class PerformanceDialog(QDialog):
         # or ``self_report`` when the inference abstained.
         self.session.classify_error(error_type)
         self._hide_diagnosis()
+        self._present_next_action(error_type)
         self.next_button.setEnabled(True)
         self._update_score_label()
+
+    # Application next-action (targeted practice) ---------------------------
+
+    def _present_next_action(self, resolved_type: str) -> None:
+        """Surface the application next-action for a resolved ``application`` miss.
+
+        Scoped to the ``application`` channel ONLY — ``content_gap`` (review the
+        backing concept) and ``misread`` (pacing nudge) are left untouched. When
+        the isolated remediation pool has eligible items for this topic/concept
+        we present a concrete, launchable practice set (real short flow, visibly
+        unscored); otherwise we degrade to the generic message rather than
+        promise a bank that isn't there. Must be called while still on the missed
+        question (before Next advances the session).
+        """
+        if resolved_type != ERR_APPLICATION:
+            return
+        topic = self.session.current.get("topic_id") or "this topic"
+        try:
+            items = self.session.application_practice_set()
+        except Exception:
+            items = []
+        self._practice_items = items
+        if items:
+            n = len(items)
+            self.next_action_label.setText(
+                f"Next action — applied-reasoning gap: you had the content but "
+                f"missed the deployment. Practice <b>{n}</b> similar integration "
+                f"item{'s' if n != 1 else ''} in <b>{topic}</b> (separate, not "
+                f"scored)."
+            )
+            self.next_action_label.setVisible(True)
+            self.practice_button.setText(
+                f"Practice {n} similar item{'s' if n != 1 else ''} →"
+            )
+            self.practice_button.setVisible(True)
+        else:
+            # Degradation contract: no eligible pool items → generic message.
+            self.next_action_label.setText(
+                f"Next action: practice more applied items in <b>{topic}</b>."
+            )
+            self.next_action_label.setVisible(True)
+            self.practice_button.setVisible(False)
+
+    def _on_launch_practice(self) -> None:
+        if not self._practice_items:
+            return
+        # imported lazily to avoid loading Qt widgets at startup
+        from aqt.mcat.remediation_dialog import RemediationDialog
+
+        items = self._practice_items
+        # One launch per miss: collapse the button so the set isn't re-run.
+        self.practice_button.setVisible(False)
+        try:
+            RemediationDialog(self, self.mw, self.store, items).exec()
+        except Exception as exc:
+            tooltip(f"Could not start practice: {exc}", parent=self)
+            return
+        self.next_action_label.setText(
+            "Applied practice complete (not scored). Continue when ready."
+        )
 
     def _update_score_label(self) -> None:
         s = self.session.summary()
@@ -405,6 +653,7 @@ class PerformanceDialog(QDialog):
     def _show_summary(self) -> None:
         self._clear_choices()
         self._hide_diagnosis()
+        self.explanation_label.setVisible(False)
         self.header.setText("Session complete")
         self.source.setText("")
         s = self.session.summary()

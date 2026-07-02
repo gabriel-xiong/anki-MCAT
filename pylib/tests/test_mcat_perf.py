@@ -2,15 +2,20 @@
 # License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
 import json
+import os
 import random
 
 from anki import mcat_perf
 from anki.mcat_perf import (
+    N_APPLICATION_PRACTICE,
     PerformanceSession,
     PerfStore,
     export_attempts,
+    export_bundle,
+    import_bundle,
     order_questions,
     read_attempts,
+    select_application_practice,
 )
 from tests.shared import getEmptyCol
 
@@ -53,6 +58,10 @@ SAMPLE_QUESTIONS = [
         "topic_id": "bb_citric_acid",
         "section": "BB",
         "skill": "2",
+        "explanation": (
+            "Succinyl-CoA to succinate is the citric acid cycle's only "
+            "substrate-level phosphorylation, directly producing one GTP/ATP."
+        ),
         "source_name": "OpenStax Biology 2e",
         "source_url": "https://openstax.org/books/biology-2e/pages/7-review-questions",
         "source_location": "Ch. 7 Review Q9",
@@ -442,6 +451,171 @@ def test_infer_application_requires_content_presence():
     assert out["error_type"] == mcat_perf.ERR_CONTENT_GAP
 
 
+def test_infer_recheck_fail_is_content_gap_high_conf():
+    # Probe FAIL = content not retrievable even when cued now → the STRONGEST
+    # content_gap signal (objective). Commits content_gap at high confidence,
+    # and does so even for an applied/synthesis item that would otherwise be
+    # application, and even on a trap landing.
+    out = mcat_perf.infer_error_type(
+        correct=False,
+        cognitive_demand="synthesis",
+        mastery=0.9,
+        time_seconds=30.0,
+        recheck_correct=False,
+    )
+    assert out["error_type"] == mcat_perf.ERR_CONTENT_GAP
+    assert out["confidence"] >= 0.85
+
+
+def test_infer_recheck_pass_applied_is_application_content_gap_suppressed():
+    # Probe PASS = content demonstrably available → content_gap SUPPRESSED, even
+    # when low M AND an authored content tag would otherwise force content_gap.
+    # An applied/synthesis miss then routes to application at raised confidence.
+    out = mcat_perf.infer_error_type(
+        correct=False,
+        cognitive_demand="application",
+        mastery=0.2,          # low M would normally → content_gap
+        has_content_tag=True,  # authored tag would normally → content_gap
+        recheck_correct=True,
+    )
+    assert out["error_type"] == mcat_perf.ERR_APPLICATION
+    assert out["confidence"] >= 0.75  # probe corroborates content held
+
+
+def test_infer_recheck_pass_trap_is_misread():
+    # Probe PASS on a trap landing → misread (execution slip on held content),
+    # confidence raised by the corroborating probe.
+    out = mcat_perf.infer_error_type(
+        correct=False,
+        cognitive_demand="recall",
+        mastery=0.5,
+        is_trap=True,
+        recheck_correct=True,
+    )
+    assert out["error_type"] == mcat_perf.ERR_MISREAD
+    assert out["confidence"] >= 0.75
+
+
+def test_infer_recheck_pass_recall_no_trap_is_misread_not_content_gap():
+    # Probe PASS on a held recall item, no trap → not content_gap (content is
+    # available); by elimination a careless slip (misread).
+    out = mcat_perf.infer_error_type(
+        correct=False, cognitive_demand="recall", mastery=0.85, recheck_correct=True
+    )
+    assert out["error_type"] == mcat_perf.ERR_MISREAD
+    assert out["error_type"] != mcat_perf.ERR_CONTENT_GAP
+
+
+def test_infer_no_recheck_unchanged():
+    # recheck_correct=None (no probe fired) leaves the demand-aware ladder
+    # untouched — a low-M applied miss is still content_gap (honesty gate).
+    out = mcat_perf.infer_error_type(
+        correct=False, cognitive_demand="application", mastery=0.2
+    )
+    assert out["error_type"] == mcat_perf.ERR_CONTENT_GAP
+
+
+def test_resolve_probe_target_skips_cars_falls_back_for_science():
+    # CARS → skip (None). A science item with no discoverable backing card in an
+    # empty collection falls back to a concept probe (card_id None, fallback).
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        cars = store.eligible_questions(set())[0]
+        assert cars["section"] == "CARS"
+        assert mcat_perf.resolve_probe_target(col, cars) is None
+
+        sci = store.eligible_questions({"bb_citric_acid"})
+        sci = next(q for q in sci if q["id"] == "q_dev_001")
+        target = mcat_perf.resolve_probe_target(col, sci)
+        assert target is not None
+        assert target["fallback"] is True
+        assert target["card_id"] is None
+        assert "bb_citric_acid" in target["front"]
+
+
+def test_session_probe_fail_commits_content_gap_and_persists():
+    col = getEmptyCol()
+    q = dict(SAMPLE_QUESTIONS[0], cognitive_demand="synthesis")
+    with PerfStore(col) as store:
+        store.upsert_questions([q])
+        qs = store.eligible_questions({"bb_citric_acid"})
+        sess = PerformanceSession(store, qs, interleaved=False)
+        wrong = (sess.correct_index() + 1) % 4
+        sess.answer(wrong, time_seconds=30.0)
+        # simulate the immediate probe: student could NOT recall it → FAIL
+        inf = sess.record_probe_outcome(False, card_id=987654321)
+        assert inf["error_type"] == mcat_perf.ERR_CONTENT_GAP
+        assert inf["confidence"] >= 0.85
+        # self-report agrees → error_source marks the probe informed the call
+        sess.classify_error("content_gap")
+
+        row = store.conn.execute(
+            "SELECT inferred_error_type, inferred_confidence, recheck_card_id, "
+            "recheck_correct, error_source, feature_json FROM perf_attempts"
+        ).fetchone()
+        assert row["inferred_error_type"] == "content_gap"
+        assert row["inferred_confidence"] >= 0.85
+        assert row["recheck_card_id"] == 987654321
+        assert row["recheck_correct"] == 0
+        assert row["error_source"] == "inference+recheck"
+        feat = json.loads(row["feature_json"])
+        assert feat["recheck_correct"] is False
+        assert feat["recheck_card_id"] == 987654321
+
+
+def test_session_probe_pass_applied_routes_to_application():
+    col = getEmptyCol()
+    q = dict(SAMPLE_QUESTIONS[0], cognitive_demand="application")
+    with PerfStore(col) as store:
+        store.upsert_questions([q])
+        qs = store.eligible_questions({"bb_citric_acid"})
+        sess = PerformanceSession(store, qs, interleaved=False)
+        wrong = (sess.correct_index() + 1) % 4
+        sess.answer(wrong, time_seconds=25.0)
+        inf = sess.record_probe_outcome(True, card_id=None)
+        assert inf["error_type"] == mcat_perf.ERR_APPLICATION
+        sess.classify_error("application")
+
+        row = store.conn.execute(
+            "SELECT inferred_error_type, recheck_card_id, recheck_correct, "
+            "error_source FROM perf_attempts"
+        ).fetchone()
+        assert row["inferred_error_type"] == "application"
+        assert row["recheck_card_id"] is None  # fallback concept probe
+        assert row["recheck_correct"] == 1
+        assert row["error_source"] == "inference+recheck"
+
+
+def test_probe_outcome_round_trips_through_bundle(tmp_path):
+    # The objective probe columns travel in the portable sync bundle.
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        store.log_attempt(
+            "q_dev_001",
+            correct=False,
+            error_type="content_gap",
+            recheck_card_id=42,
+            recheck_correct=False,
+            error_source="inference+recheck",
+        )
+        src_db = store.path
+    bundle = str(tmp_path / "b.json")
+    export_bundle(src_db, bundle)
+
+    col2 = getEmptyCol()
+    with PerfStore(col2) as dst:
+        dst.import_bundle(bundle)
+        row = dst.conn.execute(
+            "SELECT recheck_card_id, recheck_correct, error_source "
+            "FROM perf_attempts"
+        ).fetchone()
+        assert row["recheck_card_id"] == 42
+        assert row["recheck_correct"] == 0
+        assert row["error_source"] == "inference+recheck"
+
+
 def test_infer_content_tag_used_when_no_mastery():
     # no mastery signal, but the chosen distractor encodes a content misconception
     out = mcat_perf.infer_error_type(
@@ -557,6 +731,44 @@ def test_migration_adds_choice_diagnosis_column():
     with PerfStore(col) as store:
         qcols = mcat_perf._existing_columns(store.conn, "perf_questions")
         assert "choice_diagnosis" in qcols
+
+
+# explanation (static, NO-AI correct-answer rationale): additive column +
+# store->load round-trip + absent-stores-null passthrough.
+def test_migration_adds_explanation_column():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        qcols = mcat_perf._existing_columns(store.conn, "perf_questions")
+        assert "explanation" in qcols
+
+
+def test_explanation_roundtrips_through_store():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        # SAMPLE_QUESTIONS[0] carries an explanation
+        store.upsert_questions([SAMPLE_QUESTIONS[0]])
+        loaded = store.eligible_questions({"bb_citric_acid"})[0]
+        assert loaded["explanation"] == SAMPLE_QUESTIONS[0]["explanation"]
+        # persisted verbatim in the perf_questions row
+        raw = store.conn.execute(
+            "SELECT explanation FROM perf_questions WHERE id = ?",
+            ("q_dev_001",),
+        ).fetchone()
+        assert raw["explanation"] == SAMPLE_QUESTIONS[0]["explanation"]
+
+
+def test_explanation_absent_stores_null():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        # SAMPLE_QUESTIONS[1] has no explanation key (legacy / unauthored)
+        store.upsert_questions([SAMPLE_QUESTIONS[1]])
+        loaded = store.eligible_questions({"cp_acids_bases"})[0]
+        assert loaded["explanation"] is None
+        raw = store.conn.execute(
+            "SELECT explanation FROM perf_questions WHERE id = ?",
+            ("q_dev_006",),
+        ).fetchone()
+        assert raw["explanation"] is None
 
 
 def test_choice_flags_trap_and_content_and_null():
@@ -808,6 +1020,137 @@ def test_export_round_trips_attempts(tmp_path):
     assert os.path.exists(base + ".json")
 
 
+# ---------------------------------------------------------------------------
+# Calibration view (probe-aware): flat labeled rows + diagnosis/probe agreement
+# ---------------------------------------------------------------------------
+def test_calibration_export_and_agreement(tmp_path):
+    # Three probe-labeled misses spanning agree/disagree, plus a correct attempt
+    # with NO probe (must be excluded from the calibration view entirely).
+    calib_qs = [
+        dict(SAMPLE_QUESTIONS[0], id="q_dev_101", topic_id="t_gap",
+             cognitive_demand="application"),
+        dict(SAMPLE_QUESTIONS[0], id="q_dev_102", topic_id="t_app",
+             cognitive_demand="synthesis"),
+        dict(SAMPLE_QUESTIONS[0], id="q_dev_103", topic_id="t_dis",
+             cognitive_demand="application"),
+    ]
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(calib_qs)
+        # probe FAIL + low M -> pre-probe heuristic content_gap -> AGREE
+        store.log_attempt(
+            "q_dev_101", correct=False, error_type="content_gap",
+            chosen_index=0, mastery_snapshot=0.2, time_seconds=25.0,
+            inferred_error_type="content_gap", inferred_confidence=0.9,
+            recheck_card_id=111, recheck_correct=False,
+            error_source="inference+recheck",
+            feature_json={"is_trap": False, "has_content_tag": False,
+                          "trap_type": None, "maps_to": None},
+        )
+        # probe PASS + high M synthesis -> pre-probe heuristic application
+        # (NOT content_gap) -> AGREE
+        store.log_attempt(
+            "q_dev_102", correct=False, error_type="application",
+            chosen_index=0, mastery_snapshot=0.9, time_seconds=30.0,
+            inferred_error_type="application", inferred_confidence=0.8,
+            recheck_card_id=None, recheck_correct=True,
+            error_source="inference+recheck",
+            feature_json={"is_trap": False, "has_content_tag": False},
+        )
+        # probe FAIL + high M application, no tag -> pre-probe heuristic
+        # application (NOT content_gap) -> DISAGREE (probe says content missing)
+        store.log_attempt(
+            "q_dev_103", correct=False, error_type="reasoning",
+            chosen_index=0, mastery_snapshot=0.9, time_seconds=30.0,
+            inferred_error_type="content_gap", inferred_confidence=0.9,
+            recheck_card_id=222, recheck_correct=False,
+            error_source="inference+recheck",
+            feature_json={"is_trap": False, "has_content_tag": False},
+        )
+        # correct attempt, no probe -> excluded from the calibration view
+        store.log_attempt(
+            "q_dev_101", correct=True, chosen_index=1, mastery_snapshot=0.9
+        )
+        db_path = store.path
+
+    rows = mcat_perf.build_calibration_rows(db_path)
+    # only the three probe-labeled misses (the correct/no-probe row is dropped)
+    assert len(rows) == 3
+    # every flat calibration column is present, and there are no nested objects
+    for r in rows:
+        assert set(mcat_perf.CALIBRATION_COLUMNS) <= set(r)
+        for v in r.values():
+            assert not isinstance(v, (dict, list))
+
+    by_id = {r["question_id"]: r for r in rows}
+    r101 = by_id["q_dev_101"]
+    assert r101["recheck_correct"] == 0  # objective FAIL label preserved
+    assert r101["low_m"] is True
+    assert r101["high_m"] is False
+    assert r101["cognitive_demand"] == "application"
+    assert r101["is_trap"] is False
+    assert r101["heuristic_error_type"] == mcat_perf.ERR_CONTENT_GAP
+    assert r101["error_source"] == "inference+recheck"
+    # PASS row's pre-probe heuristic is application, not content_gap
+    assert by_id["q_dev_102"]["recheck_correct"] == 1
+    assert by_id["q_dev_102"]["heuristic_error_type"] == mcat_perf.ERR_APPLICATION
+
+    summary = mcat_perf.calibration_agreement(rows)
+    assert summary["labeled"] == 3
+    assert summary["tally"]["fail_content_gap"] == 1  # q_dev_101 (agree)
+    assert summary["tally"]["pass_other"] == 1        # q_dev_102 (agree)
+    assert summary["tally"]["fail_other"] == 1        # q_dev_103 (disagree)
+    assert summary["tally"]["pass_content_gap"] == 0
+    assert summary["agree"] == 2
+    assert abs(summary["agreement_rate"] - 2 / 3) < 1e-9
+
+    # both -> writes sibling .csv + .json with the flat header
+    base = str(tmp_path / "calibration")
+    assert mcat_perf.write_calibration(rows, base + ".ignored", fmt="both") == 3
+    assert os.path.exists(base + ".csv")
+    assert os.path.exists(base + ".json")
+    with open(base + ".json", encoding="utf-8") as f:
+        loaded = json.load(f)
+    assert {r["question_id"] for r in loaded} == {
+        "q_dev_101", "q_dev_102", "q_dev_103"
+    }
+    import csv
+
+    with open(base + ".csv", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        csv_rows = list(reader)
+    assert reader.fieldnames == mcat_perf.CALIBRATION_COLUMNS
+    assert len(csv_rows) == 3
+
+
+def test_calibration_agreement_empty_is_honest_abstain():
+    # No probe-labeled rows -> agreement rate is None (abstain), not a fake 0/1.
+    summary = mcat_perf.calibration_agreement([])
+    assert summary["labeled"] == 0
+    assert summary["agree"] == 0
+    assert summary["agreement_rate"] is None
+
+
+def test_calibration_flatten_tolerates_legacy_missing_feature():
+    # A probe-labeled row with NO feature_json (legacy) must flatten without
+    # crashing: feature-derived fields degrade to None, M-flags still derive.
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions([SAMPLE_QUESTIONS[0]])
+        store.log_attempt(
+            "q_dev_001", correct=False, error_type="content_gap",
+            mastery_snapshot=0.3, recheck_correct=False,
+        )
+        db_path = store.path
+    rows = mcat_perf.build_calibration_rows(db_path)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["is_trap"] is None  # no feature_json -> tolerant None
+    assert r["has_content_tag"] is None
+    assert r["low_m"] is True    # derived from mastery_snapshot regardless
+    assert r["recheck_correct"] == 0
+
+
 def test_export_rejects_unknown_format(tmp_path):
     col = getEmptyCol()
     with PerfStore(col) as store:
@@ -818,3 +1161,488 @@ def test_export_rejects_unknown_format(tmp_path):
 
     with pytest.raises(ValueError):
         export_attempts(db_path, str(tmp_path / "x.txt"), fmt="xml")
+
+
+# ---------------------------------------------------------------------------
+# Two-way sync — stable attempt uuid + append-only union-merge bundle
+# ---------------------------------------------------------------------------
+def _attempt_uuids(store):
+    return {
+        r[0]
+        for r in store.conn.execute(
+            "SELECT uuid FROM perf_attempts"
+        ).fetchall()
+    }
+
+
+def test_migration_adds_attempt_uuid_column_and_unique_index():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        # additive column present
+        acols = mcat_perf._existing_columns(store.conn, "perf_attempts")
+        assert "uuid" in acols
+        # UNIQUE index enforcing the stable key exists
+        idx = {
+            r["name"]
+            for r in store.conn.execute(
+                "PRAGMA index_list(perf_attempts)"
+            ).fetchall()
+        }
+        assert "idx_perf_attempts_uuid" in idx
+
+
+def test_log_attempt_stamps_stable_unique_uuid():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        store.log_attempt("q_dev_001", correct=True)
+        store.log_attempt("q_dev_001", correct=False, error_type="misread")
+        uuids = [
+            r[0]
+            for r in store.conn.execute(
+                "SELECT uuid FROM perf_attempts"
+            ).fetchall()
+        ]
+        # every attempt carries a non-null uuid, and they are distinct
+        assert all(u for u in uuids)
+        assert len(set(uuids)) == len(uuids) == 2
+
+
+def test_migration_backfills_legacy_null_uuids():
+    # Simulate an older sidecar row that predates the uuid column, then re-run
+    # the additive migration and confirm it is backfilled + stays unique.
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        store.log_attempt("q_dev_001", correct=True)
+        store.log_attempt("q_dev_006", correct=True)
+        store.conn.execute(
+            "UPDATE perf_attempts SET uuid = NULL WHERE question_id = 'q_dev_001'"
+        )
+        store.conn.commit()
+        assert None in _attempt_uuids(store)
+
+        mcat_perf._migrate(store.conn)
+        store.conn.commit()
+
+        uuids = _attempt_uuids(store)
+        assert None not in uuids
+        assert len(uuids) == 2  # still unique
+
+
+def test_bundle_round_trip_preserves_attempts(tmp_path):
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        store.log_attempt(
+            "q_dev_001",
+            correct=True,
+            time_seconds=9.0,
+            chosen_index=1,
+            mastery_snapshot=0.72,
+            feature_json={"schema": "t", "correct": True, "note": "café"},
+        )
+        store.log_attempt(
+            "q_dev_006", correct=False, error_type="misread", chosen_index=0
+        )
+        src_db = store.path
+
+    bundle = str(tmp_path / "bundle.json")
+    res = export_bundle(src_db, bundle)
+    assert res["attempts"] == 2
+    assert res["questions"] == 3
+
+    # bundle is a versioned JSON envelope
+    with open(bundle, encoding="utf-8") as f:
+        raw = json.load(f)
+    assert raw["format"] == mcat_perf.BUNDLE_FORMAT
+    assert raw["format_version"] == mcat_perf.BUNDLE_FORMAT_VERSION
+
+    # import into a fresh, empty device
+    col2 = getEmptyCol()
+    with PerfStore(col2) as dst:
+        r = dst.import_bundle(bundle)
+        assert r["attempts_added"] == 2
+        assert r["attempts_skipped"] == 0
+        assert r["questions_added"] == 3
+        assert dst.attempt_count() == 2
+        assert dst.question_count() == 3
+        # question context reconstructed + feature_json (non-ASCII) preserved
+        row = dst.conn.execute(
+            "SELECT feature_json FROM perf_attempts WHERE question_id = 'q_dev_001'"
+        ).fetchone()
+        assert json.loads(row["feature_json"])["note"] == "café"
+
+
+def test_bundle_merge_preserves_question_explanation(tmp_path):
+    # The explanation column travels in the portable sync bundle and is
+    # reinserted on a fresh device via the dynamic-column question merge.
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions([SAMPLE_QUESTIONS[0]])
+        src_db = store.path
+    bundle = str(tmp_path / "b.json")
+    export_bundle(src_db, bundle)
+
+    col2 = getEmptyCol()
+    with PerfStore(col2) as dst:
+        dst.import_bundle(bundle)
+        loaded = dst.eligible_questions({"bb_citric_acid"})[0]
+        assert loaded["explanation"] == SAMPLE_QUESTIONS[0]["explanation"]
+
+
+def test_bundle_union_merge_two_disjoint_devices_converge(tmp_path):
+    # Device A and B each log different attempts against the same bank.
+    colA = getEmptyCol()
+    with PerfStore(colA) as A:
+        A.upsert_questions(SAMPLE_QUESTIONS)
+        A.log_attempt("q_dev_001", correct=True)
+        A.log_attempt("q_dev_001", correct=False, error_type="content_gap")
+        a_db = A.path
+
+    colB = getEmptyCol()
+    with PerfStore(colB) as B:
+        B.upsert_questions(SAMPLE_QUESTIONS)
+        B.log_attempt("q_dev_006", correct=True)
+        b_db = B.path
+
+    bundle_a = str(tmp_path / "A.json")
+    bundle_b = str(tmp_path / "B.json")
+    export_bundle(a_db, bundle_a)
+    export_bundle(b_db, bundle_b)
+
+    # two-way: each device imports the other's bundle
+    with PerfStore(colA) as A:
+        A.import_bundle(bundle_b)
+    with PerfStore(colB) as B:
+        B.import_bundle(bundle_a)
+
+    # both converge to the union (3 attempts) with identical uuid sets
+    with PerfStore(colA) as A, PerfStore(colB) as B:
+        ua, ub = _attempt_uuids(A), _attempt_uuids(B)
+        assert A.attempt_count() == 3
+        assert B.attempt_count() == 3
+        assert ua == ub
+
+
+def test_bundle_reimport_is_idempotent(tmp_path):
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        store.log_attempt("q_dev_001", correct=True)
+        store.log_attempt("q_dev_006", correct=False, error_type="reasoning")
+        src_db = store.path
+    bundle = str(tmp_path / "b.json")
+    export_bundle(src_db, bundle)
+
+    col2 = getEmptyCol()
+    with PerfStore(col2) as dst:
+        first = dst.import_bundle(bundle)
+        assert first["attempts_added"] == 2
+        # re-importing the exact same bundle changes nothing
+        second = dst.import_bundle(bundle)
+        assert second["attempts_added"] == 0
+        assert second["attempts_skipped"] == 2
+        assert dst.attempt_count() == 2
+
+
+def test_bundle_merge_is_order_independent(tmp_path):
+    # Two source bundles; importing them in either order yields the same union.
+    colA = getEmptyCol()
+    with PerfStore(colA) as A:
+        A.upsert_questions(SAMPLE_QUESTIONS)
+        A.log_attempt("q_dev_001", correct=True)
+        a_db = A.path
+    colB = getEmptyCol()
+    with PerfStore(colB) as B:
+        B.upsert_questions(SAMPLE_QUESTIONS)
+        B.log_attempt("q_dev_006", correct=False, error_type="misread")
+        B.log_attempt("q_cars_001", correct=True)
+        b_db = B.path
+    bundle_a = str(tmp_path / "A.json")
+    bundle_b = str(tmp_path / "B.json")
+    export_bundle(a_db, bundle_a)
+    export_bundle(b_db, bundle_b)
+
+    col_ab = getEmptyCol()
+    with PerfStore(col_ab) as ab:
+        ab.import_bundle(bundle_a)
+        ab.import_bundle(bundle_b)
+        uuids_ab = _attempt_uuids(ab)
+
+    col_ba = getEmptyCol()
+    with PerfStore(col_ba) as ba:
+        ba.import_bundle(bundle_b)
+        ba.import_bundle(bundle_a)
+        uuids_ba = _attempt_uuids(ba)
+
+    assert uuids_ab == uuids_ba
+    assert len(uuids_ab) == 3
+
+
+def test_import_bundle_rejects_bad_envelope(tmp_path):
+    import pytest
+
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        bad = str(tmp_path / "bad.json")
+        with open(bad, "w", encoding="utf-8") as f:
+            json.dump({"format": "something_else", "attempts": []}, f)
+        with pytest.raises(ValueError):
+            store.import_bundle(bad)
+
+        wrong_ver = str(tmp_path / "wrong_ver.json")
+        with open(wrong_ver, "w", encoding="utf-8") as f:
+            json.dump(
+                {"format": mcat_perf.BUNDLE_FORMAT, "format_version": 999}, f
+            )
+        with pytest.raises(ValueError):
+            store.import_bundle(wrong_ver)
+
+
+def test_import_bundle_headless_creates_db(tmp_path):
+    # The module-level import_bundle (CLI path) opens/creates a sidecar DB
+    # without a live Collection and merges into it.
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        store.log_attempt("q_dev_001", correct=True)
+        src_db = store.path
+    bundle = str(tmp_path / "b.json")
+    export_bundle(src_db, bundle)
+
+    fresh_db = str(tmp_path / "fresh.mcat_perf.db")
+    res = import_bundle(fresh_db, bundle)
+    assert res["attempts_added"] == 1
+    assert res["questions_added"] == 3
+    assert os.path.exists(fresh_db)
+
+
+# ---------------------------------------------------------------------------
+# Application-practice remediation pool: isolated store + selection algorithm.
+# The pool must NEVER enter scored state (perf_questions / perf_attempts /
+# accuracy / eligible_questions). See MCAT/docs/APPLICATION-PRACTICE-POOL.md.
+# ---------------------------------------------------------------------------
+def _pool_item(item_id, topic_id, concept, *, demand="application"):
+    return {
+        "id": item_id,
+        "stem": f"Integration stem for {concept}",
+        "choices": ["A", "B", "C", "D"],
+        "correct": "A",
+        "topic_id": topic_id,
+        "section": "CP",
+        "skill": "2",
+        "cognitive_demand": demand,
+        "concept": concept,
+        "explanation": f"Because of {concept}.",
+        "source_name": "OpenStax Chemistry 2e",
+        "source_url": "https://openstax.org/books/chemistry-2e",
+        "source_location": "Ch. 17",
+        "split": "remediation",
+        "pool": "application_practice",
+    }
+
+
+# Topic A: 3 distinct concepts (mirrors the real 3-per-topic pool).
+POOL_TOPIC_A = [
+    _pool_item("ap_a_01", "cp_electrochem", "standard_cell_potential"),
+    _pool_item("ap_a_02", "cp_electrochem", "gibbs_cell_relationship",
+               demand="synthesis"),
+    _pool_item("ap_a_03", "cp_electrochem", "nernst_qualitative"),
+]
+# Topic B: distinct topic, so topic filtering is observable.
+POOL_TOPIC_B = [
+    _pool_item("ap_b_01", "cp_acids_bases", "henderson_hasselbalch"),
+    _pool_item("ap_b_02", "cp_acids_bases", "buffer_capacity"),
+]
+# Topic C: all items share ONE concept, to exercise the same-concept fallback.
+POOL_TOPIC_C = [
+    _pool_item("ap_c_01", "bb_enzymes", "michaelis_menten"),
+    _pool_item("ap_c_02", "bb_enzymes", "michaelis_menten"),
+]
+ALL_POOL = POOL_TOPIC_A + POOL_TOPIC_B + POOL_TOPIC_C
+
+
+def test_remediation_store_isolated_from_scored_bank():
+    # Upserting the pool populates remediation_items only — perf_questions (the
+    # scored bank) stays empty, so nothing can reach accuracy/eligibility.
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        assert store.upsert_remediation(ALL_POOL) == len(ALL_POOL)
+        assert store.remediation_count() == len(ALL_POOL)
+        # scored bank untouched
+        assert store.question_count() == 0
+        assert store.eligible_questions({"cp_electrochem"}) == []
+        # idempotent upsert
+        store.upsert_remediation(ALL_POOL)
+        assert store.remediation_count() == len(ALL_POOL)
+
+
+def test_remediation_rejects_scored_split():
+    # A scored ('dev'/'held_out') item must never land in the pool table.
+    import pytest
+
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        bad = dict(_pool_item("ap_x", "cp_electrochem", "c"), split="dev")
+        with pytest.raises(ValueError):
+            store.upsert_remediation([bad])
+        assert store.remediation_count() == 0
+
+
+def test_remediation_items_for_topic_filters():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_remediation(ALL_POOL)
+        a = store.remediation_items_for_topic("cp_electrochem")
+        assert {i["id"] for i in a} == {"ap_a_01", "ap_a_02", "ap_a_03"}
+        b = store.remediation_items_for_topic("cp_acids_bases")
+        assert {i["id"] for i in b} == {"ap_b_01", "ap_b_02"}
+        # unknown topic -> empty
+        assert store.remediation_items_for_topic("nope") == []
+
+
+def test_select_filters_by_topic():
+    got = select_application_practice(
+        ALL_POOL, topic_id="cp_acids_bases", missed_concept=None
+    )
+    assert {i["id"] for i in got} == {"ap_b_01", "ap_b_02"}
+    assert all(i["topic_id"] == "cp_acids_bases" for i in got)
+
+
+def test_select_excludes_missed_concept():
+    # Missed standard_cell_potential -> practice the two SIBLING concepts.
+    got = select_application_practice(
+        ALL_POOL,
+        topic_id="cp_electrochem",
+        missed_concept="standard_cell_potential",
+    )
+    ids = {i["id"] for i in got}
+    assert "ap_a_01" not in ids  # the missed-concept item is excluded
+    assert ids == {"ap_a_02", "ap_a_03"}
+    assert len(got) == 2
+
+
+def test_select_same_concept_fallback_when_excluding_empties():
+    # Topic C's items all share one concept; excluding it would empty the set,
+    # so the algorithm falls back to including same-concept items.
+    got = select_application_practice(
+        ALL_POOL, topic_id="bb_enzymes", missed_concept="michaelis_menten"
+    )
+    assert {i["id"] for i in got} == {"ap_c_01", "ap_c_02"}
+
+
+def test_select_excludes_seen_ids():
+    # Already-practiced ids are dropped so repeat misses surface NEW items.
+    got = select_application_practice(
+        ALL_POOL,
+        topic_id="cp_electrochem",
+        missed_concept="standard_cell_potential",
+        seen_ids={"ap_a_02"},
+    )
+    assert {i["id"] for i in got} == {"ap_a_03"}
+
+
+def test_select_returns_n_two_by_default():
+    # Default N = 2 even though the topic has 3 eligible items.
+    assert N_APPLICATION_PRACTICE == 2
+    got = select_application_practice(
+        ALL_POOL, topic_id="cp_electrochem", missed_concept=None
+    )
+    assert len(got) == 2
+    # variety ranking prefers distinct concepts (all A concepts are distinct)
+    assert len({i["concept"] for i in got}) == 2
+
+
+def test_select_degrades_to_empty():
+    # No pool coverage for the topic -> [] (caller shows the generic message).
+    assert select_application_practice(
+        ALL_POOL, topic_id="ps_thermo", missed_concept=None
+    ) == []
+    # everything already seen -> [] as well
+    assert select_application_practice(
+        ALL_POOL,
+        topic_id="cp_acids_bases",
+        missed_concept=None,
+        seen_ids={"ap_b_01", "ap_b_02"},
+    ) == []
+
+
+def test_remediation_attempts_never_touch_scored_state():
+    # Practice attempts log to the ISOLATED channel: they do NOT appear in
+    # perf_attempts and never move the Performance accuracy.
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        store.upsert_remediation(ALL_POOL)
+        # a real scored attempt for contrast
+        store.log_attempt("q_dev_001", correct=True)
+
+        store.log_remediation_attempt("ap_a_01", correct=False, time_seconds=12.0)
+        store.log_remediation_attempt("ap_a_02", correct=True)
+
+        # scored perf_attempts count is unchanged by the practice logging
+        assert store.attempt_count() == 1
+        assert store.accuracy()["attempts"] == 1
+        assert store.accuracy("cp_electrochem")["attempts"] == 0
+        # the seen-set reflects the practiced pool ids
+        assert store.seen_remediation_ids() == {"ap_a_01", "ap_a_02"}
+        # remediation ids are absent from the scored bank entirely
+        row = store.conn.execute(
+            "SELECT COUNT(*) FROM perf_questions WHERE id LIKE 'ap_%'"
+        ).fetchone()
+        assert row[0] == 0
+
+
+def test_pool_items_never_returned_by_eligible_questions():
+    # Even if a topic is unlocked, eligible_questions (the scored-session feed)
+    # reads perf_questions only and can never surface a remediation item.
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_remediation(ALL_POOL)
+        eligible = store.eligible_questions(
+            {"cp_electrochem", "cp_acids_bases", "bb_enzymes"}
+        )
+        assert eligible == []
+
+
+def test_session_application_practice_set_end_to_end():
+    # Through the session helper, reading the isolated store: a miss on a
+    # cp_electrochem item returns the deterministic N=2 practice set. Main-bank
+    # perf_questions carry no `concept` column (only the pool does), so the
+    # session sees missed_concept=None and variety-ranking picks the first two
+    # distinct-concept items by id.
+    col = getEmptyCol()
+    q = dict(
+        SAMPLE_QUESTIONS[0],
+        id="q_dev_050",
+        topic_id="cp_electrochem",
+        cognitive_demand="application",
+    )
+    with PerfStore(col) as store:
+        store.upsert_questions([q])
+        store.upsert_remediation(ALL_POOL)
+        qs = store.eligible_questions({"cp_electrochem"})
+        sess = PerformanceSession(store, qs, interleaved=False)
+        wrong = (sess.correct_index() + 1) % 4
+        sess.answer(wrong, time_seconds=25.0)
+        practice = sess.application_practice_set()
+        assert len(practice) == 2
+        assert {i["id"] for i in practice} == {"ap_a_01", "ap_a_02"}
+        # all drawn from the isolated pool for this topic
+        assert all(i["pool"] == "application_practice" for i in practice)
+        assert all(i["topic_id"] == "cp_electrochem" for i in practice)
+        sess.classify_error("application")
+
+
+def test_session_application_practice_set_empty_without_pool():
+    # No pool loaded -> the session helper degrades to [] (generic message).
+    col = getEmptyCol()
+    q = dict(SAMPLE_QUESTIONS[0], cognitive_demand="application")
+    with PerfStore(col) as store:
+        store.upsert_questions([q])
+        qs = store.eligible_questions({"bb_citric_acid"})
+        sess = PerformanceSession(store, qs, interleaved=False)
+        wrong = (sess.correct_index() + 1) % 4
+        sess.answer(wrong, time_seconds=25.0)
+        assert sess.application_practice_set() == []

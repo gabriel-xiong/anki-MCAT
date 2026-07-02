@@ -36,6 +36,10 @@ button {
 
 .stat {
     padding-top: 10px;
+    /* Equal side-column widths keep the auto-width #middle column (and thus the
+       centered "Show Answer" button) horizontally centered in the bottom bar,
+       despite the "More" button being wider than the "Edit" button. */
+    width: 25%;
 
     @media (max-width: 583px) {
         display: none;
