@@ -24,8 +24,9 @@ WHAT gets seeded (all offline, NO AI, NO network, NO secrets):
 
 The tester reviews locally; there is NO dependency on the builder's self-hosted
 sync server. Data comes back via the app's one-click "Export my data" button
-(Tools/dashboard) -> a portable *.perf_bundle.json (revlog + perf), documented
-in MCAT/docs/TESTER-HANDOFF.md.
+(Tools/dashboard) -> a portable *.perf_bundle.json (revlog + perf). Tester-facing
+steps: MCAT/docs/TESTER-QUICKSTART.md; builder data-flow reference:
+MCAT/docs/TESTER-HANDOFF.md.
 
 Usage (from the anki-MCAT repo root, using the fork's own build venv):
   out/pyenv/Scripts/python.exe tools/mcat_seed_tester.py
@@ -170,7 +171,7 @@ def _write_launcher(dist: Path, base_rel: str) -> None:
         "What to do: press 'Study Flashcards' and review over 2-3 days. When "
         "you're done,\r\n"
         "press 'Export my data' and send the file back. Full instructions: "
-        "TESTER-HANDOFF.\r\n",
+        "TESTER-QUICKSTART.\r\n",
         encoding="ascii",
     )
 
