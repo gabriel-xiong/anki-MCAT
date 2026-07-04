@@ -38,6 +38,7 @@ This script never opens the builder's live profile under %APPDATA%/Anki2.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -53,6 +54,23 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 PROFILE_NAME = "User 1"
 DECK_NAME = "MCAT Speedrun"
+
+# Tester scope = the documented, best-supported CONTENT topics (DECISIONS §27/§28
+# "locked eval trio": component-card granularity + the paraphrase instrument).
+# The tester build ships ONLY these 3 topics — deck cards AND question bank — so
+# a friend can realistically unlock all shipped topics and let Readiness compute
+# over a weekend (coverage is scoped to these 3; see mcat_scores.shipped_scope_*).
+# Card counts: bb_enzymes 29, cp_acids_bases 23, cp_kinetics 14 = 66 cards.
+# Question counts: 62 curated MCQs (CP 40 + BB 22), all ≥ the gates.
+SCOPE_TOPICS: tuple[str, ...] = ("cp_acids_bases", "bb_enzymes", "cp_kinetics")
+
+# New-cards/day for the shipped 3-topic tester deck. UNCAPPED (9999 ≈ unlimited):
+# per the user, a weekend tester should be able to get through ALL 66 cards of the
+# 3-topic deck as fast as they want — in one sitting if they choose — with no
+# daily gate. Anki's default (20) would otherwise ration new cards across days.
+# (The by-topic interleave below is kept but is now immaterial to unlocking, since
+# nothing is held back per day.)
+NEW_CARDS_PER_DAY = 9999
 
 
 def _default_mcat_root() -> Path:
@@ -86,10 +104,43 @@ def _seed_profile(base: Path) -> str:
     base.mkdir(parents=True, exist_ok=True)
     pm = ProfileManager(base)
     pm.setupMeta()
+    # A fresh meta has defaultLang=None. On the tester's launch the preseeded
+    # base already exists, so Anki's first-run flow (which normally prompts for
+    # and stores a default language) is skipped, and setupLangAndBackend would
+    # feed None into lang_to_disk_lang -> crash. Set a sane default so the
+    # shipped base is well-formed and launches cleanly with no prompt.
+    pm.setLang("en_US")
     pm.create(PROFILE_NAME)  # no-op if it already exists
     prof_dir = base / PROFILE_NAME
     prof_dir.mkdir(parents=True, exist_ok=True)
     return str(prof_dir / "collection.anki2")
+
+
+def _enable_fsrs(col) -> bool:
+    """Enable the v3 scheduler + FSRS so reviews populate per-card memory state.
+
+    WHY (Memory score dependency): the Memory "Recall strength" reads FSRS
+    predicted retrievability, which only exists once a card carries an FSRS
+    ``memory_state`` — and that is computed on review ONLY when FSRS is enabled.
+    A freshly created collection defaults FSRS OFF (Rust ``BoolKey::Fsrs`` is
+    false by default) and may sit on the legacy scheduler, so a tester's reviews
+    would never yield a retrievability estimate and the Memory card could never
+    compute (even at the lowered friend-tester gates). Enabling both here is a
+    data/packaging change only — NO app source change. Default FSRS parameters
+    are used; memory state is computed per review going forward (testers start at
+    zero reviews, so every review they do is scored with FSRS on).
+    """
+    from anki.config import Config
+
+    if col.sched_ver() != 2:
+        col.upgrade_to_v2_scheduler()
+    # v3 scheduler (required for FSRS).
+    col.set_config_bool(Config.Bool.SCHED_2021, True)
+    # FSRS enable is keyed by the generic "fsrs" config (Rust BoolKey::Fsrs);
+    # there is no proto Config.Bool.FSRS member, so set the raw key.
+    col.set_config("fsrs", True)
+    col._load_scheduler()
+    return bool(col.get_config("fsrs", False))
 
 
 def _import_deck(col, data_dir: Path) -> int:
@@ -116,20 +167,125 @@ def _rename_default_deck(col) -> None:
         col.decks.rename(default, DECK_NAME)
 
 
-def _seed_sidecar(col, data_dir: Path) -> tuple[int, int]:
-    """Load the question bank + application-practice pool into the sidecar."""
+def _scope_deck_to_topics(col, scope_topics: tuple[str, ...]) -> int:
+    """Delete imported notes whose topic tag is outside the shipped scope.
+
+    The CSVs carry all 15 card-backed topics; the tester ships only
+    ``scope_topics``, so drop everything else. Returns the remaining card count.
+    """
+    keep = " or ".join(f"tag:topic:{t}" for t in scope_topics)
+    drop_nids = list(col.find_notes(f"-({keep})"))
+    if drop_nids:
+        col.remove_notes(drop_nids)
+    return col.card_count()
+
+
+def _interleave_new_cards_by_topic(col) -> int:
+    """Round-robin the new-card positions across topics.
+
+    The deck CSVs are grouped by topic (all of topic A, then all of topic B, …),
+    so with Anki's default "Deck"/position gather a per-day new limit would drain
+    whole topics front-to-back and starve later topics until the deck is nearly
+    exhausted. Repositioning new cards round-robin by topic means the first N new
+    cards each day span *all* topics, so a per-day limit unlocks a broad spread
+    of topics per session instead of only the first few. Uses Anki's own
+    reposition API — no scheduler/scoring change. Returns the topic count.
+    """
+    from collections import OrderedDict
+
+    buckets: "OrderedDict[str, list]" = OrderedDict()
+    # order by position so within-topic order is preserved (import order)
+    for cid in col.find_cards("", order="c.due asc"):
+        note = col.get_card(cid).note()
+        topic = next(
+            (t for t in note.tags if t.startswith("topic:")), "topic:_untagged"
+        )
+        buckets.setdefault(topic, []).append(cid)
+
+    interleaved: list = []
+    queues = list(buckets.values())
+    while any(queues):
+        for q in queues:
+            if q:
+                interleaved.append(q.pop(0))
+
+    col.sched.reposition_new_cards(
+        interleaved,
+        starting_from=1,
+        step_size=1,
+        randomize=False,
+        shift_existing=False,
+    )
+    return len(buckets)
+
+
+def _set_new_cards_per_day(col, per_day: int) -> int:
+    """Raise the deck's new-cards/day limit in its options preset.
+
+    The single MCAT deck is the renamed Default deck (DeckId 1), which uses the
+    Default options preset. Bumping ``new.perDay`` there (not on a live tweak)
+    ships the limit in the preseeded base. Returns the value read back.
+    """
+    from anki.decks import DeckId
+
+    conf = col.decks.config_dict_for_deck_id(DeckId(1))
+    conf["new"]["perDay"] = per_day
+    col.decks.update_config(conf)
+    return col.decks.config_dict_for_deck_id(DeckId(1))["new"]["perDay"]
+
+
+def _seed_sidecar(
+    col, data_dir: Path, scope_topics: tuple[str, ...]
+) -> tuple[int, int]:
+    """Load the question bank + application-practice pool into the sidecar,
+    FILTERED to the shipped scope so only ``scope_topics`` are testable.
+
+    Filters the JSON to the scope topics and upserts directly (rather than
+    ``load_questions``) so the sidecar's perf_questions/remediation_items hold
+    only the shipped topics — this is what mcat_scores scopes coverage and the
+    Readiness section gates against. Intentionally does NOT record the builder's
+    absolute question-bank path in perf_meta (it wouldn't exist on the tester's
+    machine and is unnecessary — the re-check probe resolves backing cards from
+    the deck's ``supports_question`` tags).
+    """
     from anki.mcat_perf import PerfStore
 
+    scope = set(scope_topics)
     store = PerfStore(col)
     try:
-        n_q = store.load_questions(str(data_dir / "questions.json"))
+        with open(data_dir / "questions.json", encoding="utf-8") as f:
+            questions = json.load(f)
+        scoped_q = [q for q in questions if q.get("topic_id") in scope]
+        n_q = store.upsert_questions(scoped_q)
+
         n_r = 0
         pool = data_dir / "application-practice.json"
         if pool.exists():
-            n_r = store.load_remediation(str(pool))
+            with open(pool, encoding="utf-8") as f:
+                items = json.load(f)
+            scoped_r = [x for x in items if x.get("topic_id") in scope]
+            n_r = store.upsert_remediation(scoped_r)
         return n_q, n_r
     finally:
         store.close()
+
+
+def _bundle_docs(dist: Path, mcat_root: Path) -> None:
+    """Copy tester-facing docs into the distribution folder."""
+    src = mcat_root / "docs" / "TESTER-QUICKSTART.md"
+    if not src.exists():
+        raise SystemExit(f"missing tester quickstart: {src}")
+    shutil.copy2(src, dist / "TESTER-QUICKSTART.md")
+
+
+def _build_zip(dist: Path) -> Path:
+    """Zip MCAT-Speedrun/ for shipping alongside the MSI."""
+    zip_base = dist / "MCAT-Speedrun"
+    zip_path = dist / "MCAT-Speedrun.zip"
+    if zip_path.exists():
+        zip_path.unlink()
+    shutil.make_archive(str(zip_base), "zip", root_dir=dist, base_dir="MCAT-Speedrun")
+    return zip_path
 
 
 def _write_launcher(dist: Path, base_rel: str) -> None:
@@ -171,7 +327,7 @@ def _write_launcher(dist: Path, base_rel: str) -> None:
         "What to do: press 'Study Flashcards' and review over 2-3 days. When "
         "you're done,\r\n"
         "press 'Export my data' and send the file back. Full instructions: "
-        "TESTER-QUICKSTART.\r\n",
+        "TESTER-QUICKSTART.md (in this folder).\r\n",
         encoding="ascii",
     )
 
@@ -214,27 +370,40 @@ def main() -> None:
     col_path = _seed_profile(base)
     col = Collection(col_path)
     try:
-        n_notes = _import_deck(col, data_dir)
+        # Enable FSRS (+ v3 scheduler) FIRST so the Memory score can compute:
+        # cards only gain an FSRS memory_state (-> retrievability) when reviewed
+        # with FSRS on. Without this the tester Memory card never populates.
+        fsrs_on = _enable_fsrs(col)
+        n_imported = _import_deck(col, data_dir)
         _rename_default_deck(col)
-        n_cards = col.card_count()
+        # Scope the DECK to the shipped 3 topics BEFORE interleaving/limits.
+        n_cards = _scope_deck_to_topics(col, SCOPE_TOPICS)
+        n_interleaved_topics = _interleave_new_cards_by_topic(col)
+        new_per_day = _set_new_cards_per_day(col, NEW_CARDS_PER_DAY)
         n_topic = len(col.find_cards("tag:topic:*"))
-        n_q, n_r = _seed_sidecar(col, data_dir)
+        n_q, n_r = _seed_sidecar(col, data_dir, SCOPE_TOPICS)
         sidecar = mcat_perf.sidecar_path(col)
     finally:
         col.close()
 
     _write_launcher(dist / "MCAT-Speedrun", "mcat-base")
+    _bundle_docs(dist / "MCAT-Speedrun", mcat_root)
+    zip_path = _build_zip(dist)
 
     print("=== MCAT tester base seeded ===")
     print(f"base dir     : {base}")
     print(f"collection   : {col_path}")
     print(f"sidecar      : {sidecar}  (exists={os.path.exists(sidecar)})")
-    print(f"notes        : {n_notes}")
-    print(f"cards        : {n_cards}")
+    print(f"fsrs enabled : {fsrs_on}  (required for Memory retrievability)")
+    print(f"scope topics : {', '.join(SCOPE_TOPICS)}")
+    print(f"imported     : {n_imported} notes (all topics)")
+    print(f"cards (kept) : {n_cards}  (scoped to {len(SCOPE_TOPICS)} topics)")
     print(f"topic-tagged : {n_topic}")
+    print(f"new/day      : {new_per_day}  (interleaved across {n_interleaved_topics} topics)")
     print(f"questions    : {n_q}")
     print(f"remediation  : {n_r}")
     print(f"distribution : {dist / 'MCAT-Speedrun'}")
+    print(f"zip          : {zip_path}")
     print("\nNext: install the MSI, then double-click 'Start MCAT Speedrun.cmd'.")
 
 

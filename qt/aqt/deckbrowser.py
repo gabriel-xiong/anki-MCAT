@@ -637,15 +637,20 @@ def _mcat_card(
     info_calc: str,
     info_gate: str,
     abstaining: bool,
+    provisional: bool = False,
 ) -> str:
     # Methodology lives behind the circled-info popover (hover/click); the
     # visible surface keeps just a one-line "what it measures" blurb.
     info_html = _mcat_info_popover(info_measures, info_calc, info_gate)
-    badge = (
-        "<span class='mcat-badge mcat-badge-abstain'>not enough data</span>"
-        if abstaining
-        else "<span class='mcat-badge'>measured</span>"
-    )
+    # Badge is driven by the authoritative status: "not enough data" when
+    # abstaining; otherwise "provisional" for the small-n friend-tester profile
+    # (honest: a computed number is rough, not authoritative), else "measured".
+    if abstaining:
+        badge = "<span class='mcat-badge mcat-badge-abstain'>not enough data</span>"
+    elif provisional:
+        badge = "<span class='mcat-badge mcat-badge-provisional'>provisional</span>"
+    else:
+        badge = "<span class='mcat-badge'>measured</span>"
     return f"""
 <div class="mcat-card" style="--mcat-accent:{accent};">
   <div class="mcat-card-top">
@@ -717,6 +722,8 @@ def _mcat_focus_html(focus: dict[str, Any] | None) -> str:
 
 
 def _mcat_dashboard_html(data: dict[str, Any]) -> str:
+    from anki import mcat_scores
+
     mem = data["memory"]
     perf = data["performance"]
     read = data["readiness"]
@@ -725,37 +732,50 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
     error_summary = _mcat_error_summary(data.get("error_spread"))
 
     # Memory card: compact visible surface; methodology is tucked behind Why?
-    # Badge is driven by the SAME authoritative status the headline reads, so
-    # the "measured" badge can never coexist with a "No score yet / Need N
-    # mature cards" headline. memory_summary() reports status == "measured" ONLY
-    # when a real 0-100 Recall-strength number is displayable (review-count gate
-    # met AND >=1 mature card AND a retrievability estimate); otherwise
-    # "abstain" with the blocker reason.
+    # Badge is driven by the SAME authoritative status the headline reads, so a
+    # "measured/provisional" badge can never coexist with a "No score yet"
+    # headline. memory_summary() reports status == "measured" ONLY when a real
+    # 0-100 number is displayable; otherwise "abstain" with the blocker reason.
+    # The score BASIS is profile-dependent: strict = retrievability × maturity
+    # (durable recall); tester = retrievability only (EARLY recall strength, no
+    # 21-day maturity — provisional). We read mem["reason"] verbatim so the sub
+    # always matches whichever gate is active (never a hardcoded 200/mature copy).
     mem_abstaining = mem.get("status") != "measured"
     mem_score = mem.get("memory_score")
-    mature_cards = int(mem.get("mature_cards") or 0)
-    started_cards = int(mem.get("started_cards") or 0)
-    mature_needed = max(0, started_cards - mature_cards)
+    mem_provisional = bool(mem.get("provisional"))
+    mem_maturity_applied = bool(mem.get("maturity_applied"))
     if mem_score is None or mem_abstaining:
         mem_headline = "No score yet"
-        if mature_needed:
-            mem_sub = (
-                f"Need {mature_needed} "
-                f"{_mcat_plural(mature_needed, 'mature card')}"
-            )
-        elif int(mem["total_reviews"]) < 200:
-            need_reviews = 200 - int(mem["total_reviews"])
-            mem_sub = (
-                f"Need {need_reviews} "
-                f"{_mcat_plural(need_reviews, 'graded review')}"
-            )
-        else:
-            mem_sub = "Need FSRS memory data"
+        mem_sub = mem.get("reason") or "Not enough data yet"
     else:
         mem_headline = f"{mem_score}/100"
-        mem_sub = (
-            f"{mem['mature_pct']}% mature \u00b7 "
-            f"{mem['total_reviews']} reviews"
+        m_lo, m_hi = mem.get("score_low"), mem.get("score_high")
+        if m_lo is not None and m_hi is not None:
+            mem_sub = f"95% confidence interval: {m_lo}\u2013{m_hi}"
+        elif mem_maturity_applied:
+            mem_sub = f"{mem['mature_pct']}% mature \u00b7 {mem['total_reviews']} reviews"
+        else:
+            mem_sub = f"early recall \u00b7 {mem['total_reviews']} reviews"
+    if mem_maturity_applied:
+        mem_calc = (
+            "FSRS predicted retrievability \u00d7 how many of your started "
+            "cards are mature (interval \u226521d)."
+        )
+        mem_gate = (
+            f"Shows a score once you have \u2265{mcat_scores.MIN_MEMORY_REVIEWS} "
+            "graded reviews and \u22651 mature card."
+        )
+    else:
+        # tester profile: early recall strength (no 21-day maturity).
+        mem_calc = (
+            "PROVISIONAL: FSRS predicted retrievability over the cards you've "
+            "reviewed \u2014 EARLY recall strength (how well you'd recall right "
+            "now), NOT long-term durability (no 21-day maturity required)."
+        )
+        mem_gate = (
+            f"Provisional score after \u2265{mcat_scores.MIN_MEMORY_REVIEWS} "
+            f"reviews across \u2265{mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY} "
+            "cards. Wide interval at small samples."
         )
     mem_card = _mcat_card(
         accent="#4c7cf3",
@@ -764,19 +784,25 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
         sub=mem_sub,
         blurb="Recall strength from your reviews",
         info_measures="How well you'd recall what you've studied right now.",
-        info_calc="FSRS predicted retrievability \u00d7 how many of your "
-        "started cards are mature (interval \u226521d).",
-        info_gate="Shows a score once you have \u2265200 graded reviews.",
+        info_calc=mem_calc,
+        info_gate=mem_gate,
         abstaining=mem_abstaining,
+        provisional=mem_provisional,
     )
 
     # Performance card: headline + uncertainty only; raw accuracy is in Why?
+    # Guard on BOTH the number and the abstain status (mirrors the Memory card)
+    # so the headline number and the "not enough data" badge can NEVER coexist:
+    # under the gate performance_summary() nulls perf_score, and even if a number
+    # were present an abstaining status still forces the honest "No score yet".
     perf_abstaining = perf["status"] == "abstain"
     perf_score = perf.get("perf_score")
-    if perf_score is None:
+    perf_provisional = bool(perf.get("provisional"))
+    perf_gate = mcat_scores.MIN_PERF_ATTEMPTS
+    if perf_score is None or perf_abstaining:
         perf_headline = "No score yet"
         perf_ci = ""
-        need_attempts = max(0, 30 - int(perf["attempts"]))
+        need_attempts = max(0, perf_gate - int(perf["attempts"]))
         perf_sub = (
             f"Need {need_attempts} {_mcat_plural(need_attempts, 'attempt')}"
             if need_attempts
@@ -803,13 +829,16 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
         "topics.",
         info_calc="Adjusted for how many you've answered \u2014 Bayesian "
         "shrinkage toward 50% when the sample is small, so 1/1 isn't 100.",
-        info_gate="Measured after \u226530 answered questions. A topic unlocks "
-        "at \u22653 cards seen + \u22655 Good/Easy reviews.",
+        info_gate=f"Provisional score after \u2265{perf_gate} answered "
+        "questions; the interval is wide at small samples. A topic unlocks at "
+        "\u22653 cards seen + \u22655 Good/Easy reviews.",
         abstaining=perf_abstaining,
+        provisional=perf_provisional,
     )
 
     # Readiness card
     read_abstaining = read["status"] != "ok" or not read["range"]
+    read_provisional = bool(read.get("provisional")) and not read_abstaining
     cov_pct_r = read["coverage_pct"]
     if not read_abstaining:
         lo, hi = read["range"]
@@ -829,12 +858,12 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
             read_sub = f"{confidence} confidence"
     else:
         read_headline = "No score yet"
-        # Show coverage honestly: mark it met when \u226550% so it doesn't read
-        # like the blocker (the real blockers live in the gate note below).
+        # Show coverage honestly: mark it met when \u2265 the gate so it doesn't
+        # read like the blocker (the real blockers live in the gate note below).
         blockers = str(read["reason"] or "").split("; ")
         read_sub = (
-            "Need 50% coverage"
-            if cov_pct_r < 50
+            f"Need {mcat_scores.MIN_COVERAGE_PCT}% coverage"
+            if cov_pct_r < mcat_scores.MIN_COVERAGE_PCT
             else (blockers[0].replace("<", "under") if blockers else "Need more data")
         )
     read_card = _mcat_card(
@@ -846,10 +875,12 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
         info_measures="Estimated MCAT score range (472\u2013528).",
         info_calc="Never blends Memory or Performance. Confidence (0\u2013100) "
         "summarizes only readiness inputs \u2014 coverage, attempts, and how "
-        "narrow the range is.",
+        "narrow the range is. PROVISIONAL: the range widens at small samples "
+        "and is NOT a graded readiness claim.",
         info_gate="Shown only once there's enough data across sections; "
         "abstains (no number) below coverage/attempt thresholds.",
         abstaining=read_abstaining,
+        provisional=read_provisional,
     )
 
     cov_pct = cov["pct"]
@@ -882,6 +913,8 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
   font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }}
 .mcat-badge-abstain {{ background: var(--border, #ececf0);
   color: var(--fg-subtle, #999); }}
+.mcat-badge-provisional {{ background: rgba(245,166,35,0.16);
+  color: #b26a00; }}
 .mcat-info-wrap {{ position: relative; display: inline-flex; }}
 .mcat-info {{ font: inherit; font-size: 14px; line-height: 1;
   color: var(--fg-subtle, #9a9aa2); background: none; border: none;

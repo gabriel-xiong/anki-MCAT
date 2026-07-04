@@ -1472,6 +1472,10 @@ class PerformanceView(QWidget):
         footer_layout.addWidget(self.score_label)
         footer_layout.addStretch()
         self.next_button = QPushButton("Next")
+        self.next_button.setToolTip(
+            "Continue to the next question after you confirm your answer "
+            "and review any feedback."
+        )
         qconnect(self.next_button.clicked, self._on_next)
         footer_layout.addWidget(self.next_button)
         outer.addWidget(self.footer_bar)
@@ -2925,17 +2929,21 @@ class PerformanceView(QWidget):
 
     def _update_score_label(self) -> None:
         s = self.session.summary()
+        total = self.session.total
+        current = self.session.index + 1
         # Honest opt-out tally: "Not sure" answers are excluded from the score,
         # so surface them separately rather than hiding them.
         idk = getattr(self.session, "idk", 0)
         suffix = f"  ·  {idk} not sure" if idk else ""
+        progress = f"Question {current} of {total}"
         if s["answered"]:
             pct = round(100 * s["accuracy"])
             self.score_label.setText(
-                f"Session: {s['correct']}/{s['answered']} ({pct}%){suffix}"
+                f"{progress}  ·  Score: {s['correct']}/{s['answered']} "
+                f"({pct}%){suffix}"
             )
         else:
-            self.score_label.setText(f"Session: 0/0{suffix}")
+            self.score_label.setText(f"{progress}{suffix}")
 
     def _on_next(self) -> None:
         if self.session.awaiting_error_type:

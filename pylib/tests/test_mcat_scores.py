@@ -41,7 +41,9 @@ def test_empty_collection_abstains_everywhere():
     assert data["performance"]["status"] == "abstain"
     assert data["readiness"]["status"] == "abstain"
     assert data["readiness"]["range"] is None
-    assert data["coverage"]["total"] == mcat_scores.TOTAL_TOPICS
+    # Coverage denominator is the SHIPPED scope (topics with questions in the
+    # sidecar). An empty collection ships no bank, so the scope is empty.
+    assert data["coverage"]["total"] == 0
     assert data["coverage"]["measured"] == 0
 
 
@@ -62,7 +64,10 @@ def test_coverage_counts_topics_with_attempts():
         cov = mcat_scores.coverage_summary(col, store)
         assert cov["measured"] == 2
         assert set(cov["measured_topics"]) == {"bb_citric_acid", "cp_acids_bases"}
-        assert cov["pct"] == round(100 * 2 / mcat_scores.TOTAL_TOPICS)
+        # Denominator = shipped scope (the 2 topics with questions), not the full
+        # 18-topic outline. Both topics measured -> 100%.
+        assert cov["total"] == 2
+        assert cov["pct"] == 100
 
 
 def test_next_action_uses_most_common_error_type():
@@ -82,7 +87,24 @@ def test_next_action_uses_most_common_error_type():
 
 def test_topic_rows_cover_full_outline_with_gate_progress():
     col = getEmptyCol()
+    # A full build ships questions for every outline topic; topic_rows is scoped
+    # to the shipped bank, so seed one question per outline topic to reproduce
+    # the full-outline table.
+    full_bank = [
+        {
+            "id": f"q_{topic}",
+            "stem": f"{topic} question.",
+            "choices": ["a", "b", "c", "d"],
+            "correct": "A",
+            "topic_id": topic,
+            "section": section,
+            "source_name": "OpenStax",
+            "split": "dev",
+        }
+        for section, topic, _ in mcat_scores.OUTLINE
+    ]
     with PerfStore(col) as store:
+        store.upsert_questions(full_bank)
         rows = mcat_scores.topic_rows(col, store)
 
     # every outline topic is present (honest coverage denominator)
@@ -321,15 +343,16 @@ def test_memory_summary_exposes_headline_band_and_abstains_when_empty():
     assert mem["score_available"] is False
 
 
-def test_memory_not_measured_with_reviews_but_no_mature_cards():
-    """BUG 1: >= MIN_MEMORY_REVIEWS graded reviews but 0 mature cards must NOT
-    report status "measured".
+def test_memory_not_measured_when_reviews_met_but_card_floor_unmet():
+    """BUG 1 (profile-aware): the review-count gate can be satisfied while the
+    profile's CARD gate is NOT — Memory must abstain, never "measured" + a
+    "No score yet" headline at once.
 
-    Regression guard for the contradiction where the dashboard showed the
-    "measured" badge (gated only on review COUNT) while the headline said
-    "No score yet / Need N mature cards" (a separate maturity gate). The single
-    authoritative status must reflect whether a real Recall-strength number is
-    displayable, so these can never disagree.
+    strict profile: card gate = >=1 mature card (interval >=21d).
+    tester profile: card gate = >= MIN_STARTED_CARDS_FOR_MEMORY started cards.
+    A single immature/started card with a flooded revlog fails BOTH, so this is
+    a stable regression guard under either active profile. The single
+    authoritative status must reflect whether a real number is displayable.
     """
     col = getEmptyCol()
 
@@ -342,7 +365,7 @@ def test_memory_not_measured_with_reviews_but_no_mature_cards():
     col.sched.answerCard(c, 3)
     col.db.execute("update cards set ivl = 1 where reps > 0")
 
-    # Flood revlog past the review-count gate so ONLY the maturity gate blocks.
+    # Flood revlog past the review-count gate so ONLY the card gate blocks.
     base = 1_600_000_000_000
     rows = [
         (base + i, c.id, -1, 3, 1, 1, 2500, 1000, 1)
@@ -358,14 +381,17 @@ def test_memory_not_measured_with_reviews_but_no_mature_cards():
     mem = mcat_scores.memory_summary(col)
     # Review-count gate is satisfied ...
     assert mem["total_reviews"] >= mcat_scores.MIN_MEMORY_REVIEWS
-    # ... but there are no mature cards ...
+    # ... but there are no mature cards and only 1 started card ...
     assert mem["mature_cards"] == 0
+    assert mem["started_cards"] == 1
     # ... so it is NOT "measured" (the whole point of the fix).
     assert mem["status"] != "measured"
     assert mem["status"] == "abstain"
     assert mem["score_available"] is False
-    # The blocker reason points at the maturity gate, mirroring the headline.
-    assert "mature" in (mem["reason"] or "").lower()
+    # A real blocker reason is present (mirrors the headline); no fabricated
+    # number is shown alongside it.
+    assert mem["reason"]
+    assert mem["memory_score"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -419,19 +445,75 @@ def test_perf_band_narrows_with_n():
     assert band(0, 0) == (None, None)  # no attempts -> no band
 
 
-def test_performance_summary_headline_is_shrinkage_score_with_band():
+def test_performance_abstains_cleanly_under_gate_with_no_numeric_headline():
+    """ACCURACY-CARD HONESTY BUG (regression).
+
+    Below MIN_PERF_ATTEMPTS the Accuracy card must ABSTAIN with NO point number
+    (and no credible band) — never the self-contradictory "30/100 + not enough
+    data + CI 3–57". Raw accuracy stays available as an honest SECONDARY stat.
+    """
     col = getEmptyCol()
     with PerfStore(col) as store:
         store.upsert_questions(QUESTIONS)
-        store.log_attempt("q1", correct=True)  # first-attempt 1/1
+        store.log_attempt("q1", correct=True)  # first-attempt 1/1, n=1 << gate
         perf = mcat_scores.performance_summary(col, store)
 
-    # Headline shrinks 1/1 to 60 (not ~100); raw accuracy stays honest at 100%.
-    assert perf["perf_score"] == 60
-    assert perf["accuracy"] == 1.0
-    # Still abstains below MIN_PERF_ATTEMPTS.
+    # Under the gate: abstain, no headline number, no band — consistently.
     assert perf["status"] == "abstain"
-    # Credible band present, brackets the score, stays within [0, 100].
+    assert perf["score_available"] is False
+    assert perf["perf_score"] is None
+    assert perf["score_low"] is None and perf["score_high"] is None
+    # ...but the raw accuracy is still there for the honest "Why?" detail.
+    assert perf["accuracy"] == 1.0
+    assert perf["accuracy_low"] is not None and perf["accuracy_high"] is not None
+
+
+def _topic_questions(topic_id, section, n, prefix):
+    """n distinct questions for one topic (the headline counts FIRST attempts per
+    question, so clearing the 30-attempt gate needs 30 distinct items)."""
+    return [
+        {
+            "id": f"{prefix}{i}",
+            "stem": f"{topic_id} q{i}.",
+            "choices": ["a", "b", "c", "d"],
+            "correct": "A",
+            "topic_id": topic_id,
+            "section": section,
+            "source_name": "OpenStax",
+            "split": "dev",
+        }
+        for i in range(n)
+    ]
+
+
+def test_performance_shows_number_when_gate_clears():
+    """At/over the gate the Accuracy card shows a numeric headline + band and is
+    NOT abstaining — the complement of the honesty guard above."""
+    col = getEmptyCol()
+    # Unlock cp_acids_bases so the "≥1 unlocked topic" gate is satisfied
+    # (3 cards seen + 5 Good/Easy), mirroring the mastery-unlock test.
+    for i in range(3):
+        note = col.newNote()
+        note["Front"] = f"acids card {i}"
+        note.tags = ["topic:cp_acids_bases"]
+        col.addNote(note)
+    for _ in range(5):
+        c = col.sched.getCard()
+        assert c is not None
+        col.sched.answerCard(c, 3)
+
+    with PerfStore(col) as store:
+        bank = _topic_questions("cp_acids_bases", "CP", 30, "pa")
+        store.upsert_questions(bank)
+        # 30 distinct first attempts -> clears MIN_PERF_ATTEMPTS.
+        for i, q in enumerate(bank):
+            store.log_attempt(q["id"], correct=(i % 3 != 0))
+        perf = mcat_scores.performance_summary(col, store)
+
+    assert perf["status"] == "ok"
+    assert perf["score_available"] is True
+    assert perf["attempts"] == 30
+    assert perf["perf_score"] is not None
     lo, hi = perf["score_low"], perf["score_high"]
     assert lo is not None and hi is not None
     assert 0 <= lo <= perf["perf_score"] <= hi <= 100
@@ -444,6 +526,7 @@ def test_performance_summary_score_none_without_attempts():
     # No attempts -> no fabricated score or band (honest abstain).
     assert perf["perf_score"] is None
     assert perf["score_low"] is None and perf["score_high"] is None
+    assert perf["score_available"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -552,3 +635,262 @@ def test_idk_rows_are_invisible_to_readiness():
     assert "PS" not in after_sections
     assert baseline_sections.get("BB") == 2
     assert baseline_sections.get("CP") == 1
+
+
+# ---------------------------------------------------------------------------
+# Scoped tester build — coverage denominator + Readiness section gates follow
+# the SHIPPED bank, so a 3-topic build can actually reach ≥50% coverage and
+# compute Readiness (it is not judged against the full 18-topic / 4-section
+# outline it does not ship).
+# ---------------------------------------------------------------------------
+# A 3-topic CP+BB bank, exactly like the shipped tester (eval trio).
+SCOPED_BANK = [
+    {
+        "id": "sc_acids",
+        "stem": "Acids/bases.",
+        "choices": ["a", "b", "c", "d"],
+        "correct": "A",
+        "topic_id": "cp_acids_bases",
+        "section": "CP",
+        "source_name": "OpenStax",
+        "split": "dev",
+    },
+    {
+        "id": "sc_kinetics",
+        "stem": "Kinetics.",
+        "choices": ["a", "b", "c", "d"],
+        "correct": "A",
+        "topic_id": "cp_kinetics",
+        "section": "CP",
+        "source_name": "OpenStax",
+        "split": "dev",
+    },
+    {
+        "id": "sc_enzymes",
+        "stem": "Enzymes.",
+        "choices": ["a", "b", "c", "d"],
+        "correct": "A",
+        "topic_id": "bb_enzymes",
+        "section": "BB",
+        "source_name": "OpenStax",
+        "split": "dev",
+    },
+]
+
+
+def _flood_reviews(col, n: int) -> None:
+    """Insert ``n`` graded revlog rows so the memory-review Readiness gate clears
+    (independent of cards; Readiness only reads the review COUNT)."""
+    base = 1_600_000_000_000
+    rows = [(base + i, 1, -1, 3, 1, 1, 2500, 1000, 1) for i in range(n)]
+    col.db.executemany(
+        "insert into revlog "
+        "(id, cid, usn, ease, ivl, lastIvl, factor, time, type) "
+        "values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+
+
+def test_coverage_denominator_is_shipped_scope_not_full_outline():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SCOPED_BANK)
+        # scope = 3 shipped topics; measure 2 of them via scored attempts
+        store.log_attempt("sc_acids", correct=True)
+        store.log_attempt("sc_enzymes", correct=False, error_type="content_gap")
+        cov = mcat_scores.coverage_summary(col, store)
+
+    assert cov["total"] == 3  # NOT 18
+    assert cov["measured"] == 2
+    # 2 of 3 = 66% clears the 50% Readiness coverage gate (17% under the full
+    # outline would not).
+    assert cov["pct"] == round(100 * 2 / 3)
+    assert cov["pct"] >= mcat_scores.MIN_COVERAGE_PCT
+
+
+def test_readiness_computes_for_scoped_bank_without_all_sections():
+    """The whole point of the scope change: a CP+BB-only tester build can
+    COMPUTE Readiness once its own gates clear — the absent PS/CARS sections must
+    NOT block it forever."""
+    col = getEmptyCol()
+    _flood_reviews(col, mcat_scores.MIN_MEMORY_REVIEWS + 5)
+    with PerfStore(col) as store:
+        # 3-topic scope; a 3rd topic ships questions but stays unattempted so
+        # coverage is 2/3 = 66% (proves 2-of-3 clears the 50% gate).
+        store.upsert_questions(
+            _topic_questions("cp_acids_bases", "CP", 20, "rc_cp")
+            + _topic_questions("bb_enzymes", "BB", 15, "rc_bb")
+            + _topic_questions("cp_kinetics", "CP", 3, "rc_k")
+        )
+        for q in _topic_questions("cp_acids_bases", "CP", 20, "rc_cp"):
+            store.log_attempt(q["id"], correct=True)  # CP, 20 distinct
+        for q in _topic_questions("bb_enzymes", "BB", 15, "rc_bb"):
+            store.log_attempt(q["id"], correct=True)  # BB, 15 distinct
+        read = mcat_scores.readiness_summary(col, store)
+        cov = mcat_scores.coverage_summary(col, store)
+
+    assert cov["total"] == 3 and cov["measured"] == 2  # 66% coverage
+    assert read["status"] == "ok", read.get("reason")
+    assert read["range"] is not None
+    assert read["coverage_pct"] >= mcat_scores.MIN_COVERAGE_PCT
+    assert read.get("confidence_score") is not None
+
+
+def test_readiness_still_enforces_shipped_section_gaps():
+    """Scoping does NOT weaken honesty: a shipped section with too few attempts
+    still blocks Readiness (here BB is shipped but unattempted), while the sole
+    blocker is BB — never the un-shipped PS/CARS sections."""
+    col = getEmptyCol()
+    _flood_reviews(col, mcat_scores.MIN_MEMORY_REVIEWS + 5)
+    with PerfStore(col) as store:
+        store.upsert_questions(
+            _topic_questions("cp_acids_bases", "CP", 20, "rs_cp")
+            + _topic_questions("cp_kinetics", "CP", 15, "rs_k")
+            + _topic_questions("bb_enzymes", "BB", 3, "rs_bb")  # shipped, unattempted
+        )
+        # 35 distinct attempts but ALL in CP; coverage 2/3, attempts gate cleared.
+        for q in _topic_questions("cp_acids_bases", "CP", 20, "rs_cp"):
+            store.log_attempt(q["id"], correct=True)
+        for q in _topic_questions("cp_kinetics", "CP", 15, "rs_k"):
+            store.log_attempt(q["id"], correct=True)
+        read = mcat_scores.readiness_summary(col, store)
+
+    assert read["status"] == "abstain"
+    assert read["range"] is None
+    # The ONLY blocker is the missing BB attempts — NOT attempts/coverage, and
+    # NOT PS/CARS (not shipped -> not gated). Wording tracks the active gate.
+    assert read["reason"] == (
+        f"BB attempts < {mcat_scores.MIN_ATTEMPTS_PER_SCIENCE_SECTION}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Friend-tester ENGAGEMENT profile — low/attainable gates, PROVISIONAL scores,
+# and the honesty safeguards that make the low gates defensible (very wide CIs
+# at small n; a truly empty profile still abstains). NOT the graded methodology.
+# ---------------------------------------------------------------------------
+def test_active_profile_is_low_and_provisional():
+    """The shipped build runs the low friend-tester gates + provisional flag."""
+    assert mcat_scores.SCORE_PROFILE == "tester"
+    assert mcat_scores.PROVISIONAL_SCORES is True
+    # Attainable in a single ~15-20 min sitting.
+    assert mcat_scores.MIN_PERF_ATTEMPTS <= 10
+    assert mcat_scores.MIN_MEMORY_REVIEWS < 100
+    assert mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY <= 15
+    # Maturity is NOT required at tester scale (21d is unreachable in a weekend).
+    assert mcat_scores.REQUIRE_MEMORY_MATURITY is False
+
+
+def test_readiness_range_widens_at_small_n():
+    """Honesty safeguard: the provisional Readiness range is WIDER at small n
+    and collapses to the strict ±6 at/above the comfortable attempt count."""
+    hw = mcat_scores._readiness_half_width
+    # Monotonic non-increasing as the sample grows.
+    widths = [hw(n) for n in (mcat_scores.MIN_PERF_ATTEMPTS, 15, 30, 100)]
+    assert widths == sorted(widths, reverse=True)
+    # At/above the comfortable count the widening is zero (strict ±6 preserved).
+    assert hw(mcat_scores.READINESS_COMFORTABLE_ATTEMPTS) == 6
+    assert hw(1000) == 6
+    # At the tester gate the half-width is much wider (no false precision).
+    assert hw(mcat_scores.MIN_PERF_ATTEMPTS) >= 15
+
+
+def test_perf_credible_interval_is_very_wide_at_tester_gate():
+    """At the tester attempts gate the credible interval must be VERY wide, so a
+    computed Accuracy score visibly reads as rough (no false precision)."""
+    n = mcat_scores.MIN_PERF_ATTEMPTS
+    lo, hi = mcat_scores._perf_band(n // 2, n)  # ~50% accuracy at the gate
+    # Span at least ~30 points on the 0-100 scale at this small n.
+    assert (hi - lo) * 100 >= 30
+
+
+def test_readiness_computes_with_provisional_fields_and_wide_range():
+    """Short-session friend-tester data clears the low gates and Readiness
+    COMPUTES — carrying the mandatory honesty fields (range, coverage %, a
+    confidence number, a provisional/missing-data note, and a next action) with
+    a visibly wide range at small n."""
+    col = getEmptyCol()
+    _flood_reviews(col, mcat_scores.MIN_MEMORY_REVIEWS + 2)
+    with PerfStore(col) as store:
+        # ~8-12 questions across 2 topics (one per shipped science section),
+        # clearing the overall + per-section attempt gates at tester scale.
+        cp = _topic_questions("cp_acids_bases", "CP", 6, "ep_cp")
+        bb = _topic_questions("bb_enzymes", "BB", 5, "ep_bb")
+        kin = _topic_questions("cp_kinetics", "CP", 3, "ep_k")  # shipped, unattempted
+        store.upsert_questions(cp + bb + kin)
+        for q in cp:
+            store.log_attempt(q["id"], correct=True)
+        for q in bb:
+            store.log_attempt(q["id"], correct=(q["id"].endswith(("0", "1", "2"))))
+        read = mcat_scores.readiness_summary(col, store)
+        cov = mcat_scores.coverage_summary(col, store)
+
+    assert read["status"] == "ok", read.get("reason")
+    lo, hi = read["range"]
+    assert lo is not None and hi is not None
+    assert 472 <= lo < hi <= 528
+    # Wide range at small n (honesty): well beyond the strict ±6 (width 12).
+    assert (hi - lo) > 12
+    # Mandatory honesty fields.
+    assert cov["pct"] >= mcat_scores.MIN_COVERAGE_PCT
+    assert read["coverage_pct"] == cov["pct"]
+    assert read.get("confidence_score") is not None
+    assert read.get("provisional") is True
+    assert read.get("note")  # missing-data / provisional caveat
+    assert read.get("next_action")  # single next action
+
+
+def test_empty_profile_still_abstains_under_tester_gates():
+    """Even at the low friend-tester gates, a profile with ZERO data must
+    abstain on all three scores — the gates never fabricate a number."""
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        data = mcat_scores.dashboard_data(col, store)
+    assert data["memory"]["status"] == "abstain"
+    assert data["memory"]["memory_score"] is None
+    assert data["performance"]["status"] == "abstain"
+    assert data["performance"]["perf_score"] is None
+    assert data["readiness"]["status"] == "abstain"
+    assert data["readiness"]["range"] is None
+
+
+def test_memory_computes_from_retrievability_without_maturity_at_tester_scale():
+    """tester profile: Memory computes from FSRS retrievability (EARLY recall
+    strength) WITHOUT any 21-day-mature card, once the small started-card floor
+    is met — and it is flagged provisional with a band present."""
+    if mcat_scores.REQUIRE_MEMORY_MATURITY:  # pragma: no cover - strict build
+        import pytest
+
+        pytest.skip("strict profile requires maturity")
+
+    from anki.config import Config
+
+    col = getEmptyCol()
+    if col.sched_ver() != 2:
+        col.upgrade_to_v2_scheduler()
+    col.set_config_bool(Config.Bool.SCHED_2021, True)
+    col.set_config("fsrs", True)
+    col._load_scheduler()
+
+    n = mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY + 2
+    for i in range(n):
+        note = col.newNote()
+        note["Front"] = f"mem card {i}"
+        note.tags = ["topic:cp_acids_bases"]
+        col.addNote(note)
+    for _ in range(n):
+        c = col.sched.getCard()
+        assert c is not None
+        col.sched.answerCard(c, 3)  # Good -> FSRS memory_state populated
+    # Force every card immature so the score CANNOT be coming from maturity.
+    col.db.execute("update cards set ivl = 1 where reps > 0")
+
+    mem = mcat_scores.memory_summary(col)
+    assert mem["mature_cards"] == 0  # nothing is 21-day mature
+    assert mem["started_cards"] >= mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY
+    assert mem["avg_retrievability"] is not None and mem["avg_retrievability"] > 0
+    assert mem["status"] == "measured"
+    assert mem["memory_score"] is not None
+    assert mem["maturity_applied"] is False
+    assert mem["provisional"] is True
+    assert mem["score_low"] is not None and mem["score_high"] is not None

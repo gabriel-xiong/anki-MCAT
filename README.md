@@ -81,15 +81,18 @@ python -m pytest pylib/tests/test_mcat_mastery.py \
 
 ## License & credit
 
-This project is a fork of **Anki** by Ankitects Pty Ltd and is distributed
+This project is a fork of **Anki** by Ankitects Pty Ltd
+([`ankitects/anki`](https://github.com/ankitects/anki)) and is distributed
 under the **GNU AGPL-3.0-or-later** — see [LICENSE](./LICENSE). The mobile
 companion work is based on **AnkiDroid**
-(<https://github.com/ankidroid/Anki-Android>), also AGPL-3.0-or-later.
+([`ankidroid/Anki-Android`](https://github.com/ankidroid/Anki-Android)), also
+AGPL-3.0-or-later.
 
 All upstream copyright remains with the original Anki and AnkiDroid authors;
-the MCAT Speedrun additions above are contributed under the same license. This
-is an independent project and is **not affiliated with or endorsed by**
-Ankitects or the AnkiDroid team.
+the MCAT Speedrun additions above are contributed under the same
+AGPL-3.0-or-later license, and the complete corresponding source is published
+with any distribution (AGPL §13). This is an independent project and is
+**not affiliated with or endorsed by** Ankitects or the AnkiDroid team.
 
 ---
 

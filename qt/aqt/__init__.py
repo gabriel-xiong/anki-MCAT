@@ -250,6 +250,12 @@ def setupLangAndBackend(
         lang = pm.meta["defaultLang"]
     else:
         lang = force or pm.meta["defaultLang"]
+    # a preseeded or legacy profile may carry no default language (defaultLang
+    # is None in a freshly created meta, and the first-run flow that would set
+    # it is skipped for such profiles); fall back to the system default rather
+    # than crashing in lang_to_disk_lang().
+    if not lang:
+        lang = anki.lang.get_def_lang(force)[1]
     lang = anki.lang.lang_to_disk_lang(lang)
 
     # set active language

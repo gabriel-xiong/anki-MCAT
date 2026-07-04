@@ -139,30 +139,46 @@ def setup_ai_toggle_action(mw: AnkiQt, menu: QMenu) -> None:
 
 
 def setup_performance_host(mw: AnkiQt) -> None:
-    """Reserve a main-window slot for embedded performance sessions."""
-    if getattr(mw, "mcatPerformanceSlot", None) is not None:
+    """Reserve a stacked main-area page for embedded performance sessions.
+
+    The performance host occupies the SAME layout cell as ``mw.web`` (via
+    ``QStackedWidget``), so opening a session fully replaces the deck-browser
+    webview instead of stacking a small Qt panel above it — which let the
+    dashboard bleed through on Windows/WebEngine.
+    """
+    if getattr(mw, "mcatPerformanceStack", None) is not None:
         return
     from aqt import gui_hooks
-    from aqt.qt import QVBoxLayout, QWidget
+    from aqt.qt import QStackedWidget, QVBoxLayout, QWidget, QSizePolicy, Qt
 
-    slot = QWidget(mw)
+    web_idx = mw.mainLayout.indexOf(mw.web)
+    mw.mainLayout.removeWidget(mw.web)
+
+    stack = QStackedWidget()
+    stack.setObjectName("mcatPerformanceStack")
+    stack.setSizePolicy(
+        QSizePolicy.Policy.Expanding,
+        QSizePolicy.Policy.Expanding,
+    )
+    stack.addWidget(mw.web)
+
+    slot = QWidget()
     slot.setObjectName("mcatPerformanceSlot")
-    slot.hide()
-    from aqt.qt import QSizePolicy, Qt
-
     slot.setSizePolicy(
         QSizePolicy.Policy.Expanding,
         QSizePolicy.Policy.Expanding,
     )
-    # Opaque host so the deck-browser/dashboard (in mw.web) and the gray
-    # main-window canvas can never bleed through/around the performance view.
-    # The concrete theme color is applied by the view's apply_theme() at show.
+    # Opaque host so the deck-browser/dashboard can never bleed through.
     slot.setAutoFillBackground(True)
     slot.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
     slot._layout = QVBoxLayout(slot)  # type: ignore[attr-defined]
     slot._layout.setContentsMargins(0, 0, 0, 0)  # type: ignore[attr-defined]
     slot._layout.setSpacing(0)  # type: ignore[attr-defined]
-    mw.mainLayout.insertWidget(1, slot)
+    stack.addWidget(slot)
+
+    mw.mainLayout.insertWidget(web_idx, stack)
+    mw.mainLayout.setStretchFactor(stack, 1)
+    mw.mcatPerformanceStack = stack
     mw.mcatPerformanceSlot = slot
     mw.mcatPerformanceView = None
     gui_hooks.theme_did_change.append(lambda: _refresh_performance_theme(mw))
@@ -177,7 +193,7 @@ def _refresh_performance_theme(mw: AnkiQt) -> None:
 def _exit_performance(mw: AnkiQt) -> None:
     """Tear down the embedded view and restore the normal Anki shell."""
     slot = getattr(mw, "mcatPerformanceSlot", None)
-    view = getattr(mw, "mcatPerformanceView", None)
+    stack = getattr(mw, "mcatPerformanceStack", None)
     if slot is not None:
         layout = slot._layout  # type: ignore[attr-defined]
         while layout.count():
@@ -185,9 +201,11 @@ def _exit_performance(mw: AnkiQt) -> None:
             w = item.widget()
             if w is not None:
                 w.deleteLater()
-        slot.hide()
     mw.mcatPerformanceView = None
-    mw.web.show()
+    if stack is not None:
+        stack.setCurrentWidget(mw.web)
+    else:
+        mw.web.show()
     mw.bottomWeb.show()
     mw.bottomWeb.adjustHeightToFit()
     if mw.state == "deckBrowser":
@@ -201,6 +219,7 @@ def _show_performance_view(mw: AnkiQt, view: QWidget) -> None:
     from aqt.sound import av_player
 
     slot = mw.mcatPerformanceSlot
+    stack = mw.mcatPerformanceStack
     layout = slot._layout  # type: ignore[attr-defined]
     while layout.count():
         item = layout.takeAt(0)
@@ -209,16 +228,14 @@ def _show_performance_view(mw: AnkiQt, view: QWidget) -> None:
             w.deleteLater()
     layout.addWidget(view)
     mw.mcatPerformanceView = view
-    # Now that the view is parented into the slot, theme both (this paints the
-    # slot's opaque background too) BEFORE showing, so nothing flashes through.
+    # Theme before the stack flip so nothing flashes through on show.
     view.apply_theme()
     av_player.stop_and_clear_queue()
-    mw.web.hide()
+    stack.setCurrentWidget(slot)
     mw.bottomWeb.hide()
     deck_browser = getattr(mw, "deckBrowser", None)
     if deck_browser is not None:
         deck_browser._refresh_needed = True
-    slot.show()
     view.setFocus()
 
 

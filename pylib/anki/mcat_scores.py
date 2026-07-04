@@ -28,14 +28,73 @@ if TYPE_CHECKING:
     from anki.collection import Collection
 
 # ---------------------------------------------------------------------------
-# Thresholds — mirror data/scoring-config.json give_up.
+# Thresholds — score abstain gates. TWO pre-registered profiles.
+#
+# See MCAT/docs/EVAL-THRESHOLDS.md + docs/DECISIONS.md (§33) for the full
+# rationale. In short:
+#
+#   * "strict"  — the full-course production gates (the original
+#     data/scoring-config.json give_up: 200 reviews, 30 attempts, 21-day card
+#     maturity). These are what a GRADED readiness claim would use.
+#   * "tester"  — FRIEND-TESTER ENGAGEMENT gates. Deliberately LOW so a casual
+#     friend who studies for a single ~15-20 min sitting (≈10-20 cards rated,
+#     ≈8-12 questions across 1-2 topics) still sees all three PROVISIONAL scores
+#     populate — so the build "feels" alive. NOT used for graded readiness
+#     claims. Honesty is preserved by (a) VERY WIDE confidence intervals at these
+#     small n (no false precision), (b) PROVISIONAL / small-n labels on every
+#     score, (c) coverage %, a missing-data note and a next action on each, and
+#     (d) a truly EMPTY profile (0 data) STILL abstaining.
+#
+# This build ships the "tester" profile. The device computes live, provisional
+# scores; it never fabricates — 0 data always abstains.
 # ---------------------------------------------------------------------------
-MIN_MEMORY_REVIEWS = 200
-MIN_PERF_ATTEMPTS = 30
+SCORE_PROFILE = "tester"  # "tester" | "strict"
+PROVISIONAL_SCORES = SCORE_PROFILE == "tester"
+
+# strict (full-course) gates — retained for reference / a future graded build.
+_STRICT_THRESHOLDS = {
+    "min_memory_reviews": 200,
+    "min_perf_attempts": 30,
+    "min_coverage_pct": 50,
+    "min_attempts_per_science_section": 5,
+    "min_cars_attempts": 5,
+    # Memory: require ≥1 card at a mature interval (≥21d) AND score = R × maturity.
+    "require_memory_maturity": True,
+    "min_started_cards_for_memory": 0,  # governed by the maturity gate instead
+}
+# tester-scale (friend-tester engagement) gates — ACTIVE this build.
+_TESTER_THRESHOLDS = {
+    "min_memory_reviews": 10,
+    "min_perf_attempts": 8,
+    # Coverage unchanged: the 3-topic shipped scope already makes 2/3 = 66%
+    # reachable, so 50% is honest AND attainable in one short sitting.
+    "min_coverage_pct": 50,
+    "min_attempts_per_science_section": 3,
+    "min_cars_attempts": 3,
+    # Memory: 21-day maturity is unreachable in a weekend, so we do NOT require
+    # it; Memory instead reports EARLY RECALL STRENGTH = FSRS retrievability only
+    # (score = R × 100), gated on a small floor of reviewed cards so the average
+    # is not from 1-2 cards. Caveated as provisional / short-interval everywhere.
+    "require_memory_maturity": False,
+    "min_started_cards_for_memory": 10,
+}
+_ACTIVE_THRESHOLDS = (
+    _TESTER_THRESHOLDS if SCORE_PROFILE == "tester" else _STRICT_THRESHOLDS
+)
+
+MIN_MEMORY_REVIEWS = _ACTIVE_THRESHOLDS["min_memory_reviews"]
+MIN_PERF_ATTEMPTS = _ACTIVE_THRESHOLDS["min_perf_attempts"]
 MIN_UNLOCKED_TOPICS = 1
-MIN_COVERAGE_PCT = 50
-MIN_ATTEMPTS_PER_SCIENCE_SECTION = 5
-MIN_CARS_ATTEMPTS = 5
+MIN_COVERAGE_PCT = _ACTIVE_THRESHOLDS["min_coverage_pct"]
+MIN_ATTEMPTS_PER_SCIENCE_SECTION = _ACTIVE_THRESHOLDS["min_attempts_per_science_section"]
+MIN_CARS_ATTEMPTS = _ACTIVE_THRESHOLDS["min_cars_attempts"]
+# Memory maturity handling (see profile notes above).
+REQUIRE_MEMORY_MATURITY = _ACTIVE_THRESHOLDS["require_memory_maturity"]
+MIN_STARTED_CARDS_FOR_MEMORY = _ACTIVE_THRESHOLDS["min_started_cards_for_memory"]
+# Sample size at/above which the Readiness range needs NO small-n widening (the
+# strict full-course attempt count). Below it the range widens so a small-n
+# estimate visibly reads as rough (honesty safeguard; see _readiness_half_width).
+READINESS_COMFORTABLE_ATTEMPTS = _STRICT_THRESHOLDS["min_perf_attempts"]
 
 # ---------------------------------------------------------------------------
 # Score-model params — mirror data/scoring-config.json ("memory"/"performance").
@@ -260,14 +319,22 @@ def _memory_band(
     The band therefore *widens when few cards contribute* and *narrows as the
     card count grows*. Clamped to [0, 100]. Returns ``(None, None)`` when there
     is no retrievability estimate or no started cards.
+
+    IMPLEMENTATION NOTE — boundary-safe interval: we use the WILSON interval on
+    the mean recall probability (modeling ``k = round(R·n)`` of ``n`` started
+    cards as "currently recalled"), scaled by the maturity factor. The plain
+    normal SE ``z·sqrt(R(1-R)/n)`` COLLAPSES to zero as ``R → 1``, which shows
+    FALSE PRECISION right after a review (FSRS retrievability ≈ 1.0). Wilson
+    stays honestly WIDE at small ``n`` even at the boundary (e.g. 18/18 →
+    ~[0.82, 1.0]) — the small-sample honesty safeguard — while still narrowing
+    as ``n`` grows.
     """
     if retrievability is None or n_cards <= 0:
         return (None, None)
-    score = retrievability * maturity * 100
-    se = math.sqrt(max(0.0, retrievability * (1 - retrievability) / n_cards))
-    half = z * se * maturity * 100
-    low = max(0.0, score - half)
-    high = min(100.0, score + half)
+    k = max(0, min(n_cards, int(round(retrievability * n_cards))))
+    lo_p, hi_p = _wilson(k, n_cards, z)
+    low = max(0.0, lo_p * maturity * 100)
+    high = min(100.0, hi_p * maturity * 100)
     return (_round_half_up(low), _round_half_up(high))
 
 
@@ -297,35 +364,55 @@ def memory_summary(col: Collection) -> dict[str, Any]:
     # Mat = card-level memory maturity (interval >= 21d), NOT exam coverage.
     mature_cards, started_cards, maturity = _deck_maturity(col)
 
-    # Headline "Recall strength" + uncertainty band (widens at low card count).
-    score = _memory_score(avg_retr, maturity)
-    score_low, score_high = _memory_band(avg_retr, maturity, started_cards)
+    # PROFILE-DEPENDENT score basis (the three scores are still never blended —
+    # this only changes WHICH memory-domain signals feed the Memory headline):
+    #   * strict  — Recall strength = retrievability × deck maturity. Rewards
+    #     durable, long-interval memory (needs ≥1 mature card at ≥21d).
+    #   * tester  — EARLY RECALL STRENGTH = retrievability only (maturity factor
+    #     forced to 1.0). A weekend friend cannot reach a 21-day interval, so we
+    #     measure "how well you'd recall right now what you've reviewed", NOT
+    #     long-term durability. Explicitly provisional / short-interval.
+    mat_factor = maturity if REQUIRE_MEMORY_MATURITY else 1.0
+
+    # Headline + uncertainty band (widens at low card count via SE(R) ∝ 1/√n).
+    score = _memory_score(avg_retr, mat_factor)
+    score_low, score_high = _memory_band(avg_retr, mat_factor, started_cards)
     mature_pct = round(100 * maturity)
 
     # Single authoritative status so the badge and headline can NEVER disagree.
-    # A real "Recall strength" number is only displayable when BOTH gates clear:
-    #   1. review-count gate: >= MIN_MEMORY_REVIEWS graded reviews, AND
-    #   2. maturity gate: at least one mature card (mature_cards > 0) so the
-    #      maturity factor isn't 0, AND a retrievability estimate exists (score
-    #      is not None).
-    # When it can't be shown we abstain with the specific blocker, mirroring the
-    # headline copy — so a >= MIN_MEMORY_REVIEWS deck with 0 mature cards is
-    # reported as "abstain" (not "measured"), never both at once.
+    # A real number is only displayable when the review-count gate clears, the
+    # profile's maturity/coverage gate clears, AND a retrievability estimate
+    # exists (score is not None). When it can't be shown we abstain with the
+    # specific blocker, mirroring the headline copy — never "measured" + a "no
+    # score" headline at once.
     review_gate_met = total_reviews >= MIN_MEMORY_REVIEWS
-    score_displayable = review_gate_met and mature_cards > 0 and score is not None
+    if REQUIRE_MEMORY_MATURITY:
+        maturity_gate_met = mature_cards > 0
+    else:
+        # tester: need a small floor of reviewed cards so the retrievability
+        # average is not from just 1-2 cards (keeps the small-n honest).
+        maturity_gate_met = started_cards >= MIN_STARTED_CARDS_FOR_MEMORY
+    score_displayable = review_gate_met and maturity_gate_met and score is not None
 
     if not review_gate_met:
         reason: Optional[str] = (
             f"Needs ≥{MIN_MEMORY_REVIEWS} graded reviews "
             f"(have {total_reviews})."
         )
-    elif mature_cards == 0:
-        # Maturity blocker: with no mature cards the maturity factor is 0, so
-        # any number would be a meaningless 0 — treat as not-yet-measured.
+    elif REQUIRE_MEMORY_MATURITY and mature_cards == 0:
+        # strict maturity blocker: with no mature cards the maturity factor is 0,
+        # so any number would be a meaningless 0 — treat as not-yet-measured.
         need = max(1, started_cards - mature_cards)
         reason = (
             f"Need {need} mature cards "
             f"(interval ≥{MEMORY_MATURITY_INTERVAL_DAYS}d)."
+        )
+    elif not maturity_gate_met:
+        # tester floor blocker: review a few more cards for a stable estimate.
+        need = max(1, MIN_STARTED_CARDS_FOR_MEMORY - started_cards)
+        reason = (
+            f"Review {need} more {'card' if need == 1 else 'cards'} "
+            f"(have {started_cards})."
         )
     elif score is None:
         reason = "Need FSRS memory data."
@@ -337,10 +424,15 @@ def memory_summary(col: Collection) -> dict[str, Any]:
         "status": "measured" if score_displayable else "abstain",
         # True iff the headline shows a real Recall-strength number.
         "score_available": score_displayable,
-        # NEW headline: 0-100 Recall strength = retrievability × deck maturity.
+        # 0-100 Recall strength. strict: retrievability × maturity. tester:
+        # retrievability only (EARLY recall strength — see maturity_applied).
         "memory_score": score,
         "score_low": score_low,
         "score_high": score_high,
+        # Provisional / basis flags so the renderer can label honestly.
+        "provisional": PROVISIONAL_SCORES and score_displayable,
+        "profile": SCORE_PROFILE,
+        "maturity_applied": REQUIRE_MEMORY_MATURITY,
         # Secondary raw stats (kept honest beneath the headline).
         "total_reviews": total_reviews,
         "topics_studied": topics_studied,
@@ -432,23 +524,13 @@ def performance_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
     accuracy = overall["accuracy"]
     unlocked = unlocked_topic_ids(col)
 
-    # Headline = reliability-adjusted accuracy 0-100 (Beta shrinkage), with a
-    # credible band from the same posterior. Raw accuracy + Wilson interval are
-    # kept as honest secondary stats. All None when there are no attempts.
+    # Raw accuracy + Wilson interval are honest SECONDARY stats (shown under
+    # "Why?"), kept whenever there is any attempt regardless of the gate.
     if accuracy is None:
         accuracy_low: Optional[float] = None
         accuracy_high: Optional[float] = None
-        perf_score: Optional[int] = None
-        score_low: Optional[int] = None
-        score_high: Optional[int] = None
     else:
         accuracy_low, accuracy_high = _wilson(correct, attempts)
-        post_mean = _perf_shrinkage(correct, attempts)
-        assert post_mean is not None  # attempts > 0 here
-        perf_score = _round_half_up(post_mean * 100)
-        band_lo, band_hi = _perf_band(correct, attempts)
-        score_low = _round_half_up(band_lo * 100)  # type: ignore[arg-type]
-        score_high = _round_half_up(band_hi * 100)  # type: ignore[arg-type]
 
     abstain_reasons = []
     if attempts < MIN_PERF_ATTEMPTS:
@@ -459,10 +541,35 @@ def performance_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
         abstain_reasons.append(
             f"needs ≥{MIN_UNLOCKED_TOPICS} unlocked topic"
         )
+    abstaining = bool(abstain_reasons)
+
+    # HONESTY (mirrors Memory/Readiness): the 0-100 headline number AND its
+    # credible band are populated ONLY when the gate clears. Below the gate we
+    # abstain cleanly — never a point number AND a "not enough data" badge at
+    # once (the self-contradictory "30/100 + not enough data + CI 3–57" bug).
+    if abstaining or accuracy is None:
+        perf_score: Optional[int] = None
+        score_low: Optional[int] = None
+        score_high: Optional[int] = None
+    else:
+        post_mean = _perf_shrinkage(correct, attempts)
+        assert post_mean is not None  # attempts > 0 here
+        perf_score = _round_half_up(post_mean * 100)
+        band_lo, band_hi = _perf_band(correct, attempts)
+        score_low = _round_half_up(band_lo * 100)  # type: ignore[arg-type]
+        score_high = _round_half_up(band_hi * 100)  # type: ignore[arg-type]
 
     return {
-        "status": "abstain" if abstain_reasons else "ok",
-        # NEW headline: 0-100 reliability-adjusted accuracy + credible band.
+        "status": "abstain" if abstaining else "ok",
+        # True iff the headline shows a real 0-100 number (parity with Memory's
+        # score_available). The renderer keys the badge/headline off this so they
+        # can NEVER disagree.
+        "score_available": not abstaining,
+        # Provisional flag (small-n friend-tester profile) so the renderer labels
+        # a computed score as rough rather than authoritative.
+        "provisional": PROVISIONAL_SCORES and not abstaining,
+        "profile": SCORE_PROFILE,
+        # 0-100 reliability-adjusted accuracy + credible band (None below gate).
         "perf_score": perf_score,
         "score_low": score_low,
         "score_high": score_high,
@@ -478,13 +585,48 @@ def performance_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Shipped scope — the coverage denominator and the Readiness per-section attempt
+# gates are scoped to what THIS build actually ships (the perf sidecar is the
+# shipped source of truth), NOT the full 18-topic outline. A scoped tester build
+# (e.g. 3 content topics in CP+BB) must be judged against ITS OWN topics/sections
+# — otherwise coverage caps at 3/18 = 17% and the PS/CARS section gates can never
+# clear, so Readiness could NEVER compute. A full build that ships every outline
+# topic and all four sections reproduces the previous behavior exactly (scope ==
+# outline, sections == {CP, BB, PS, CARS}).
+# ---------------------------------------------------------------------------
+def shipped_scope_topics(store: PerfStore) -> set[str]:
+    """Outline topics this build ships questions for.
+
+    Intersected with the outline so an unrecognized id can never inflate the
+    coverage denominator. Empty when no question bank is loaded.
+    """
+    rows = store.conn.execute("SELECT DISTINCT topic_id FROM perf_questions")
+    shipped = {r["topic_id"] for r in rows}
+    return {t for t in OUTLINE_TOPIC_IDS if t in shipped}
+
+
+def shipped_scope_sections(store: PerfStore) -> set[str]:
+    """Sections this build ships questions for.
+
+    Drives which per-section Readiness attempt gates apply, so a build that
+    ships no PS/CARS content is not blocked forever by those sections.
+    """
+    rows = store.conn.execute("SELECT DISTINCT section FROM perf_questions")
+    return {r["section"] for r in rows if r["section"]}
+
+
+# ---------------------------------------------------------------------------
 # Coverage
 # ---------------------------------------------------------------------------
 def coverage_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
-    """Fraction of outline topics with measurement (cards seen or attempts)."""
+    """Fraction of the SHIPPED-scope topics with measurement (cards seen or
+    scored attempts). The denominator is the topics this build ships questions
+    for (see ``shipped_scope_topics``), so a 3-topic tester is measured against
+    3 — unlocking 2 of 3 is 66% (≥ the 50% Readiness gate)."""
+    scope = shipped_scope_topics(store)
     measured: set[str] = set()
     for m in col.get_topic_mastery():
-        if m.cards_seen > 0 and m.topic_id in OUTLINE_TOPIC_IDS:
+        if m.cards_seen > 0 and m.topic_id in scope:
             measured.add(m.topic_id)
     # IDK ("Not sure") rows are abstentions, not scored engagement — exclude
     # them so a topic answered only with "Not sure" does NOT count toward
@@ -494,13 +636,14 @@ def coverage_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
         "JOIN perf_questions q ON q.id = a.question_id "
         "WHERE a.idk = 0"
     ):
-        if row["topic_id"] in OUTLINE_TOPIC_IDS:
+        if row["topic_id"] in scope:
             measured.add(row["topic_id"])
 
-    pct = round(100 * len(measured) / TOTAL_TOPICS) if TOTAL_TOPICS else 0
+    total = len(scope)
+    pct = round(100 * len(measured) / total) if total else 0
     return {
         "measured": len(measured),
-        "total": TOTAL_TOPICS,
+        "total": total,
         "pct": pct,
         "measured_topics": sorted(measured),
     }
@@ -569,6 +712,11 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
     perf = performance_summary(col, store)
     cov = coverage_summary(col, store)
     section_attempts = _section_attempt_counts(store)
+    # Only gate on sections THIS build actually ships (see shipped_scope_sections).
+    # A 3-topic tester in CP+BB must not be blocked forever by the absent PS/CARS
+    # sections; a full build shipping all four is gated on all four exactly as
+    # before.
+    shipped_sections = shipped_scope_sections(store)
 
     reasons: list[str] = []
     if mem["total_reviews"] < MIN_MEMORY_REVIEWS:
@@ -578,9 +726,15 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
     if cov["pct"] < MIN_COVERAGE_PCT:
         reasons.append(f"coverage < {MIN_COVERAGE_PCT}%")
     for sec in SCIENCE_SECTIONS:
-        if section_attempts.get(sec, 0) < MIN_ATTEMPTS_PER_SCIENCE_SECTION:
+        if (
+            sec in shipped_sections
+            and section_attempts.get(sec, 0) < MIN_ATTEMPTS_PER_SCIENCE_SECTION
+        ):
             reasons.append(f"{sec} attempts < {MIN_ATTEMPTS_PER_SCIENCE_SECTION}")
-    if section_attempts.get(CARS_SECTION, 0) < MIN_CARS_ATTEMPTS:
+    if (
+        CARS_SECTION in shipped_sections
+        and section_attempts.get(CARS_SECTION, 0) < MIN_CARS_ATTEMPTS
+    ):
         reasons.append(f"CARS attempts < {MIN_CARS_ATTEMPTS}")
 
     if reasons:
@@ -591,10 +745,13 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
             "range": None,
         }
 
-    # Eligible — provisional map (coefficients deferred). Attach a numeric
-    # confidence summarizing how well-supported the range is (coverage,
-    # attempts, range width) — NOT a blend of the other two scores.
-    low, high = _provisional_range(store)
+    # Eligible — provisional map (coefficients deferred). The range WIDENS when
+    # the performance sample is small (honest: fewer attempts -> noisier section
+    # accuracy -> a less certain mapped score), so a friend-tester's small-n
+    # Readiness visibly reads as rough. Attach a numeric confidence summarizing
+    # how well-supported the range is (coverage, attempts, range width) — NOT a
+    # blend of the other two scores.
+    low, high = _provisional_range(store, perf["attempts"])
     confidence_score = _readiness_confidence(
         cov["pct"] / 100.0, perf["attempts"], high - low
     )
@@ -603,14 +760,43 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
         "coverage_pct": cov["pct"],
         "reason": None,
         "range": [low, high],
-        # NEW: numeric 0-100 confidence (headline detail). Bucket label kept as
-        # a secondary descriptor for backward-compatible consumers.
+        # numeric 0-100 confidence (headline detail). Bucket label kept as a
+        # secondary descriptor for backward-compatible consumers.
         "confidence_score": confidence_score,
         "confidence": _confidence_bucket(confidence_score),
+        # Provisional flag + honesty note + single next action (mandatory).
+        "provisional": PROVISIONAL_SCORES,
+        "note": (
+            "Provisional / small-n estimate — wide range. "
+            "Not a graded readiness claim."
+            if PROVISIONAL_SCORES
+            else None
+        ),
+        "next_action": (
+            "Answer more questions across both sections to tighten the range."
+        ),
     }
 
 
-def _provisional_range(store: PerfStore) -> tuple[int, int]:
+def _readiness_half_width(attempts: int) -> int:
+    """Half-width (± points) of the provisional Readiness range.
+
+    Base ±6, widened when the performance sample is small so a low-n estimate is
+    visibly rough (no false precision). At/above READINESS_COMFORTABLE_ATTEMPTS
+    the widening is zero (the strict full-course behavior, ±6, is preserved);
+    below it the deficit grows the half-width up to ``base + extra_max``. Purely
+    a function of sample size — never of the point value — so it cannot be tuned
+    to flatter a number.
+    """
+    base = 6
+    extra_max = 18
+    comfortable = READINESS_COMFORTABLE_ATTEMPTS
+    n = max(0, attempts)
+    deficit = (max(0, comfortable - n) / comfortable) if comfortable else 0.0
+    return base + _round_half_up(extra_max * deficit)
+
+
+def _provisional_range(store: PerfStore, attempts: int = 0) -> tuple[int, int]:
     total = 0.0
     for sec in ("CP", "CARS", "BB", "PS"):
         # AVG(a.correct) drives the provisional readiness range. IDK rows are
@@ -626,7 +812,8 @@ def _provisional_range(store: PerfStore) -> tuple[int, int]:
         acc = row["acc"] if row and row["acc"] is not None else 0.0
         total += SECTION_MIN + acc * (SECTION_MAX - SECTION_MIN)
     center = round(total)
-    return (max(472, center - 6), min(528, center + 6))
+    half = _readiness_half_width(attempts)
+    return (max(472, center - half), min(528, center + half))
 
 
 # ---------------------------------------------------------------------------
@@ -738,19 +925,24 @@ def focus_area(col: Collection, store: PerfStore) -> dict[str, Any]:
 def topic_rows(
     col: Collection, store: Optional[PerfStore] = None
 ) -> list[dict[str, Any]]:
-    """Every outline topic joined with the Rust mastery query + performance.
+    """Every SHIPPED-scope topic joined with the Rust mastery query + performance.
 
     This is the exact data the unlock gate runs on, exposed for the UI so a
-    user can see *why* a topic is (or isn't) unlocked. Topics with no cards
-    still appear (all zeros), so coverage is honest.
+    user can see *why* a topic is (or isn't) unlocked. Scoped to the topics this
+    build actually ships (see ``shipped_scope_topics``) so a 3-topic tester shows
+    3 rows, not the full 18-topic outline; a full build shows every topic. Topics
+    in scope with no cards still appear (all zeros), so coverage is honest.
     """
     own_store = store is None
     if store is None:
         store = PerfStore(col)
     try:
+        scope = shipped_scope_topics(store)
         mastery = {m.topic_id: m for m in col.get_topic_mastery()}
         rows: list[dict[str, Any]] = []
         for section, topic_id, name in OUTLINE:
+            if topic_id not in scope:
+                continue
             m = mastery.get(topic_id)
             cards_total = int(m.cards_total) if m else 0
             cards_seen = int(m.cards_seen) if m else 0
