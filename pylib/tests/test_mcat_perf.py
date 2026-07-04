@@ -4,6 +4,7 @@
 import json
 import os
 import random
+import tempfile
 
 from anki import mcat_perf
 from anki.mcat_perf import (
@@ -147,14 +148,19 @@ def test_log_attempt_and_accuracy():
         assert store.attempt_count() == 3
 
         overall = store.accuracy()
-        assert overall["attempts"] == 3
+        assert overall["attempts"] == 2  # first attempt per question only
         assert overall["correct"] == 2
-        assert abs(overall["accuracy"] - 2 / 3) < 1e-9
+        assert abs(overall["accuracy"] - 1.0) < 1e-9
+
+        raw = store.accuracy(first_attempt_only=False)
+        assert raw["attempts"] == 3
+        assert raw["correct"] == 2
+        assert abs(raw["accuracy"] - 2 / 3) < 1e-9
 
         topic = store.accuracy("bb_citric_acid")
-        assert topic["attempts"] == 2
+        assert topic["attempts"] == 1
         assert topic["correct"] == 1
-        assert topic["accuracy"] == 0.5
+        assert topic["accuracy"] == 1.0
 
 
 def test_reset_attempts_clears_attempts_keeps_questions():
@@ -278,6 +284,105 @@ def test_session_walks_to_completion():
         assert sess.finished
         assert store.attempt_count() == total
         assert sess.summary()["accuracy"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# "Not sure" (IDK) anti-guessing opt-out
+# ---------------------------------------------------------------------------
+def test_idk_attempt_excluded_from_accuracy_and_tracked():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+
+        store.log_attempt("q_dev_001", correct=True, time_seconds=10.0)
+        # An IDK on a DIFFERENT question, logged BEFORE any real attempt on it,
+        # must be skipped by the first-attempt subquery (idk = 0 filter) so it
+        # neither becomes the counted "first attempt" nor moves accuracy.
+        store.log_attempt(
+            "q_dev_006", correct=False, error_type="content_gap", idk=True
+        )
+
+        acc = store.accuracy()
+        assert acc["attempts"] == 1  # only q_dev_001; the IDK is excluded
+        assert acc["correct"] == 1
+        assert acc["accuracy"] == 1.0
+        # ...but the opt-out IS tracked, overall and per topic.
+        assert store.idk_count() == 1
+        assert store.idk_count("cp_acids_bases") == 1
+        assert store.idk_count("bb_citric_acid") == 0
+        # The IDK'd topic stays honest-abstain (no scored attempt there yet).
+        assert store.accuracy("cp_acids_bases")["accuracy"] is None
+
+        # A real (scored) attempt on the IDK'd question now counts, and the
+        # earlier IDK row still does not leak into numerator/denominator.
+        store.log_attempt("q_dev_006", correct=True, time_seconds=15.0)
+        acc2 = store.accuracy()
+        assert acc2["attempts"] == 2
+        assert acc2["correct"] == 2
+        assert acc2["accuracy"] == 1.0
+        assert store.idk_count() == 1  # unchanged
+        # attempt_count is a raw row count, so it DOES include the IDK row.
+        assert store.attempt_count() == 3
+
+
+def test_session_not_sure_non_cars_maps_to_content_gap():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        qs = [
+            q
+            for q in store.eligible_questions({"bb_citric_acid"})
+            if q["section"] != "CARS"
+        ]
+        sess = PerformanceSession(store, qs, interleaved=False)
+        assert sess.current_is_cars is False
+
+        sess.not_sure()
+
+        # Not a graded attempt: no awaiting-classification state, accuracy
+        # untouched, session summary unaffected, but the opt-out is tallied.
+        assert sess.awaiting_error_type is False
+        assert sess.idk == 1
+        assert sess.summary()["answered"] == 0
+        assert sess.summary()["accuracy"] is None
+        assert store.accuracy()["accuracy"] is None
+        assert store.idk_count() == 1
+
+        row = store.conn.execute(
+            "SELECT correct, error_type, idk, error_source FROM perf_attempts"
+        ).fetchone()
+        assert row["idk"] == 1
+        assert row["correct"] == 0  # never counts as correct for mastery/unlock
+        assert row["error_type"] == "content_gap"  # routes remediation
+        assert row["error_source"] == "idk"
+
+        # Advances like a normal resolved question (nothing to confirm).
+        sess.advance()
+        assert sess.index == 1
+
+
+def test_session_not_sure_cars_logs_unresolved():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        qs = [
+            q for q in store.eligible_questions(set()) if q["section"] == "CARS"
+        ]
+        sess = PerformanceSession(store, qs, interleaved=False)
+        assert sess.current_is_cars is True
+
+        sess.not_sure()
+
+        assert sess.idk == 1
+        assert store.accuracy()["accuracy"] is None
+        assert store.idk_count() == 1
+        row = store.conn.execute(
+            "SELECT correct, error_type, idk FROM perf_attempts"
+        ).fetchone()
+        assert row["idk"] == 1
+        assert row["correct"] == 0
+        # CARS already skips error typing → IDK is just unresolved, no content_gap.
+        assert row["error_type"] == "unresolved"
 
 
 # ---------------------------------------------------------------------------
@@ -496,14 +601,53 @@ def test_infer_recheck_pass_trap_is_misread():
     assert out["confidence"] >= 0.75
 
 
-def test_infer_recheck_pass_recall_no_trap_is_misread_not_content_gap():
-    # Probe PASS on a held recall item, no trap → not content_gap (content is
-    # available); by elimination a careless slip (misread).
+def test_infer_recheck_pass_recall_no_trap_is_application_not_misread():
+    # Probe PASS on a held recall item, no trap → content was available but the
+    # MCQ was still wrong: applied reasoning, NOT misread or content_gap.
     out = mcat_perf.infer_error_type(
         correct=False, cognitive_demand="recall", mastery=0.85, recheck_correct=True
     )
-    assert out["error_type"] == mcat_perf.ERR_MISREAD
+    assert out["error_type"] == mcat_perf.ERR_APPLICATION
+    assert out["error_type"] != mcat_perf.ERR_MISREAD
     assert out["error_type"] != mcat_perf.ERR_CONTENT_GAP
+
+
+def test_infer_recheck_confidence_varies_with_signals():
+    # Regression for the "always 90% content / 65% applied" bug: the PROBE branch
+    # (branch 0) is what the live UI actually shows (record_probe_outcome re-runs
+    # inference with recheck_correct set), and it must NOT emit a per-outcome
+    # constant. Vary M / demand / timing under a FIXED probe outcome and assert
+    # the confidence genuinely moves.
+    fail_confs = {
+        mcat_perf.infer_error_type(
+            correct=False, cognitive_demand="recall", mastery=m,
+            recheck_correct=False,
+        )["confidence"]
+        for m in (0.2, 0.55, 0.9)  # low / mid / high M
+    }
+    assert len(fail_confs) >= 3, fail_confs  # not one flat FAIL constant
+    pass_confs = {
+        mcat_perf.infer_error_type(
+            correct=False, cognitive_demand="recall", mastery=0.5,
+            recheck_correct=True,
+        )["confidence"],
+        mcat_perf.infer_error_type(
+            correct=False, cognitive_demand="application", mastery=0.5,
+            recheck_correct=True,
+        )["confidence"],
+        mcat_perf.infer_error_type(
+            correct=False, cognitive_demand="synthesis", mastery=0.9,
+            recheck_correct=True,
+        )["confidence"],
+        mcat_perf.infer_error_type(
+            correct=False, cognitive_demand="application", mastery=0.5,
+            time_seconds=3.0, recheck_correct=True,
+        )["confidence"],
+    }
+    assert len(pass_confs) >= 3, pass_confs  # not one flat PASS constant
+    # The old bug pinned FAIL→0.9 and PASS→0.65; assert they no longer collapse
+    # to a single shared value.
+    assert fail_confs != pass_confs
 
 
 def test_infer_no_recheck_unchanged():
@@ -513,6 +657,92 @@ def test_infer_no_recheck_unchanged():
         correct=False, cognitive_demand="application", mastery=0.2
     )
     assert out["error_type"] == mcat_perf.ERR_CONTENT_GAP
+
+
+# Fine mastery grid used to lock in "confidence genuinely MOVES with M" (the
+# 2026-07-03 fix) rather than collapsing to per-branch constants. Anchors span
+# the low / mid / high bands around LOW_M=0.4 and HIGH_M=0.7.
+_M_SWEEP = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+
+def test_infer_probe_fail_content_gap_confidence_varies_with_mastery():
+    # Branch 0 FAIL is what the LIVE UI shows on essentially every miss. Lock in
+    # that its confidence genuinely MOVES across the M grid (the fixed
+    # degeneracy) and trends DOWN as mastery rises (low M corroborates the gap
+    # most; high M weakly contradicts), while staying content_gap and honestly
+    # bounded high. Assert variation + ordering, NOT brittle magic numbers.
+    confs = []
+    for m in _M_SWEEP:
+        out = mcat_perf.infer_error_type(
+            correct=False,
+            cognitive_demand="recall",
+            mastery=m,
+            time_seconds=30.0,
+            recheck_correct=False,
+        )
+        assert out["error_type"] == mcat_perf.ERR_CONTENT_GAP
+        assert 0.85 <= out["confidence"] <= 0.97  # bounded; never fabricated
+        confs.append(out["confidence"])
+    # not one flat FAIL constant across mastery
+    assert len(set(confs)) >= 3, confs
+    # non-increasing in M, and low-M is strictly more confident than high-M
+    assert confs == sorted(confs, reverse=True), confs
+    assert confs[0] > confs[-1], confs
+
+
+def test_infer_no_probe_applied_transitions_and_confidence_rises_with_mastery():
+    # Offline-replay ladder (recheck None): an applied-demand miss must
+    # TRANSITION content_gap (low M — content not held) -> application (high M —
+    # held but misapplied), and the application confidence must RISE with M.
+    rows = [
+        (
+            m,
+            mcat_perf.infer_error_type(
+                correct=False,
+                cognitive_demand="application",
+                mastery=m,
+                time_seconds=30.0,
+            ),
+        )
+        for m in _M_SWEEP
+    ]
+    # error_type transitions across the mastery grid
+    assert rows[0][1]["error_type"] == mcat_perf.ERR_CONTENT_GAP  # M=0.0
+    assert rows[-1][1]["error_type"] == mcat_perf.ERR_APPLICATION  # M=1.0
+    # confidence genuinely varies across the whole grid (not a single constant)
+    all_confs = [out["confidence"] for _, out in rows]
+    assert len(set(all_confs)) >= 3, all_confs
+    # within the application region confidence is non-decreasing in M, and the
+    # top of the grid is strictly more confident than the first applied point
+    app = [
+        out["confidence"]
+        for _, out in rows
+        if out["error_type"] == mcat_perf.ERR_APPLICATION
+    ]
+    assert app == sorted(app), app
+    assert app[-1] > app[0], app
+
+
+def test_infer_probe_pass_applied_confidence_rises_with_mastery():
+    # The other half of the fix: probe PASS routes to application and M NUDGES
+    # the confidence up (the probe already settled content-held), so it must
+    # still MOVE with mastery rather than emit a flat PASS constant.
+    low = mcat_perf.infer_error_type(
+        correct=False,
+        cognitive_demand="application",
+        mastery=0.2,
+        time_seconds=30.0,
+        recheck_correct=True,
+    )
+    high = mcat_perf.infer_error_type(
+        correct=False,
+        cognitive_demand="application",
+        mastery=0.95,
+        time_seconds=30.0,
+        recheck_correct=True,
+    )
+    assert low["error_type"] == high["error_type"] == mcat_perf.ERR_APPLICATION
+    assert high["confidence"] > low["confidence"], (low, high)
 
 
 def test_resolve_probe_target_skips_cars_falls_back_for_science():
@@ -531,7 +761,216 @@ def test_resolve_probe_target_skips_cars_falls_back_for_science():
         assert target is not None
         assert target["fallback"] is True
         assert target["card_id"] is None
-        assert "bb_citric_acid" in target["front"]
+        assert "bb_citric_acid" not in target["front"]
+        assert "underlying rule or relationship" in target["front"]
+
+
+def test_resolve_probe_target_uses_question_card_map_when_no_collection_cards():
+    col = getEmptyCol()
+    mcat_perf._QUESTION_CARD_MAP["q_dev_001"] = {
+        "topic_id": "bb_citric_acid",
+        "fronts": [
+            "In the citric acid cycle, GTP/ATP is made during the conversion of "
+            "{{c1::succinyl-CoA to succinate}}."
+        ],
+    }
+    try:
+        with PerfStore(col) as store:
+            store.upsert_questions(SAMPLE_QUESTIONS)
+            sci = next(
+                q
+                for q in store.eligible_questions({"bb_citric_acid"})
+                if q["id"] == "q_dev_001"
+            )
+            target = mcat_perf.resolve_probe_target(col, sci)
+            assert target is not None
+            assert target["fallback"] is True
+            assert target["card_id"] is None
+            # The cloze deletion (the ANSWER) must be HIDDEN in the pre-reveal
+            # prompt, not filled in — mirroring the real-card path.
+            assert "succinyl-CoA to succinate" not in target["front"]
+            assert "[…]" in target["front"]
+            assert "{{c1" not in target["front"]
+            assert "bb_citric_acid" not in target["front"]
+            # The answer still lives in the reveal field so "Reveal answer" works.
+            assert "succinyl-CoA" in sci["explanation"] or target["back"]
+    finally:
+        mcat_perf._QUESTION_CARD_MAP.clear()
+
+
+def test_probe_fallback_hides_cloze_deletion_genetics():
+    """The screenshot-1 genetics cloze must render answer-HIDDEN in fallback."""
+    col = getEmptyCol()
+    mcat_perf._QUESTION_CARD_MAP["q_dev_030"] = {
+        "topic_id": "bb_genetics",
+        "fronts": [
+            "A monohybrid cross Aa × Aa gives a phenotypic ratio of "
+            "{{c1::3:1}} and a genotypic ratio of {{c1::1:2:1}}."
+        ],
+    }
+    try:
+        q = {
+            "id": "q_dev_030",
+            "stem": "Monohybrid cross ratio probe test",
+            "choices": ["A", "B", "C", "D"],
+            "correct": "A",
+            "topic_id": "bb_genetics",
+            "section": "BB",
+            "explanation": "Aa × Aa → 3:1 phenotypic, 1:2:1 genotypic.",
+            "source_name": "test",
+            "split": "dev",
+        }
+        with PerfStore(col) as store:
+            store.upsert_questions([q])
+            target = mcat_perf.resolve_probe_target(col, q)
+            assert target is not None
+            assert target["fallback"] is True
+            # Neither ratio (the answers) may appear in the pre-reveal prompt.
+            assert "3:1" not in target["front"]
+            assert "1:2:1" not in target["front"]
+            assert target["front"].count("[…]") == 2
+            assert "{{c" not in target["front"]
+            # The reveal still carries the answer.
+            assert "3:1" in target["back"]
+    finally:
+        mcat_perf._QUESTION_CARD_MAP.clear()
+
+
+def test_hide_cloze_front_variants():
+    """Unit check: blank plain deletions, keep hints, leave non-cloze intact."""
+    assert (
+        mcat_perf._hide_cloze_front("ratio is {{c1::3:1}}.") == "ratio is […]."
+    )
+    # Hint form {{cN::answer::hint}} shows the hint, never the answer.
+    assert (
+        mcat_perf._hide_cloze_front("capital is {{c1::Paris::city}}.")
+        == "capital is [city]."
+    )
+    # Multiple deletions each blank independently.
+    assert (
+        mcat_perf._hide_cloze_front("{{c1::A}} and {{c2::B}}") == "[…] and […]"
+    )
+    # Non-cloze fronts are unaffected.
+    plain = "What two steps write the complement of a DNA strand?"
+    assert mcat_perf._hide_cloze_front(plain) == plain
+
+
+def test_resolve_probe_target_map_prefers_basic_front():
+    col = getEmptyCol()
+    mcat_perf._QUESTION_CARD_MAP["q_syn_018"] = {
+        "topic_id": "bb_dna",
+        "fronts": [
+            "In DNA, A pairs with {{c1::T}} and G pairs with {{c1::C}}.",
+            "To write the complement of a DNA strand in the 5'→3' direction, "
+            "what two steps do you take?",
+        ],
+    }
+    try:
+        with PerfStore(col) as store:
+            q = {
+                "id": "q_syn_018",
+                "stem": "DNA complement probe test",
+                "choices": ["A", "B", "C", "D"],
+                "correct": "A",
+                "topic_id": "bb_dna",
+                "section": "BB",
+                "explanation": "Pair bases, then reverse for antiparallel strands.",
+                "source_name": "test",
+                "split": "dev",
+            }
+            store.upsert_questions([q])
+            target = mcat_perf.resolve_probe_target(col, q)
+            assert target is not None
+            assert "complement of a DNA strand" in target["front"]
+            assert "Pair bases" in target["back"]
+    finally:
+        mcat_perf._QUESTION_CARD_MAP.clear()
+
+
+def test_resolve_probe_target_uses_supports_question_tag():
+    col = getEmptyCol()
+    note = col.newNote()
+    note["Front"] = "What enzyme makes GTP in the citric acid cycle?"
+    note["Back"] = "Succinyl-CoA synthetase"
+    note.tags = ["topic:bb_citric_acid", "supports_question:q_dev_001"]
+    col.addNote(note)
+    cid = col.find_cards("tag:supports_question:q_dev_001")[0]
+
+    with PerfStore(col) as store:
+        store.upsert_questions(SAMPLE_QUESTIONS)
+        sci = next(
+            q
+            for q in store.eligible_questions({"bb_citric_acid"})
+            if q["id"] == "q_dev_001"
+        )
+        target = mcat_perf.resolve_probe_target(col, sci)
+        assert target is not None
+        assert target["fallback"] is False
+        assert target["card_id"] == cid
+        assert "GTP" in target["front"]
+        assert "Succinyl" in target["back"]
+
+
+def test_resolve_probe_target_self_heals_stale_map_from_sidecar():
+    # Regression: a bank loaded before question-card-map.json existed (or a map
+    # since regenerated with new entries) leaves the in-memory map without this
+    # question. resolve_probe_target must force-reload from the sidecar's
+    # recorded bank path and use the authored front instead of going generic.
+    col = getEmptyCol()
+    with tempfile.TemporaryDirectory() as d:
+        qpath = os.path.join(d, "questions.json")
+        q = {
+            "id": "q_dev_electro",
+            "stem": "Nernst probe self-heal test",
+            "choices": ["A", "B", "C", "D"],
+            "correct": "A",
+            "topic_id": "cp_electrochem",
+            "section": "CP",
+            "explanation": "Raising product-ion concentration raises Q, lowering Ecell.",
+            "source_name": "test",
+            "split": "dev",
+        }
+        with open(qpath, "w", encoding="utf-8") as f:
+            json.dump([q], f)
+        with PerfStore(col) as store:
+            store.load_questions(qpath)  # records question_bank_path in sidecar
+        # Simulate the map being written/regenerated AFTER the bank was loaded,
+        # while the in-memory copy is stale (empty here).
+        mpath = os.path.join(d, "question-card-map.json")
+        with open(mpath, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "q_dev_electro": {
+                        "topic_id": "cp_electrochem",
+                        "fronts": [
+                            "By the Nernst equation, raising product-ion "
+                            "concentration raises {{c1::Q}}."
+                        ],
+                    }
+                },
+                f,
+            )
+        mcat_perf._QUESTION_CARD_MAP.clear()
+        try:
+            target = mcat_perf.resolve_probe_target(col, q)
+            assert target is not None
+            assert target["fallback"] is True
+            # Self-heal used the AUTHORED front from the sidecar map (not the
+            # generic fallback): the sentence context is present, with the cloze
+            # answer HIDDEN as a blank so nothing leaks pre-reveal.
+            assert "raising product-ion concentration raises" in target["front"]
+            assert "[…]" in target["front"]
+            assert "Q" not in target["front"]
+            assert "{{c1" not in target["front"]
+            assert "cp_electrochem" not in target["front"]
+            # The reveal fills ONLY the blanked cloze from the same sentence —
+            # no "Answer:" prefix and no explanation blurb ("Ecell" is unique to
+            # the question's explanation, so it must not appear in the reveal).
+            assert "Q" in target["back"]
+            assert "Answer:" not in target["back"]
+            assert "Ecell" not in target["back"]
+        finally:
+            mcat_perf._QUESTION_CARD_MAP.clear()
 
 
 def test_session_probe_fail_commits_content_gap_and_persists():
@@ -1633,6 +2072,192 @@ def test_session_application_practice_set_end_to_end():
         assert all(i["pool"] == "application_practice" for i in practice)
         assert all(i["topic_id"] == "cp_electrochem" for i in practice)
         sess.classify_error("application")
+
+
+# ---------------------------------------------------------------------------
+# Backend fixes: choice_feedback, session cap/modes, resume, display labels
+# ---------------------------------------------------------------------------
+QUESTION_WITH_FEEDBACK = dict(
+    SAMPLE_QUESTIONS[0],
+    choice_feedback=[
+        "Incorrect — wrong step.",
+        "Correct — substrate-level phosphorylation.",
+        "Incorrect — confuses intermediate.",
+        "Incorrect — near miss.",
+    ],
+)
+
+
+def test_choice_feedback_roundtrips_through_store():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions([QUESTION_WITH_FEEDBACK])
+        loaded = store.eligible_questions({"bb_citric_acid"})[0]
+        assert loaded["choice_feedback"][1].startswith("Correct")
+        assert len(loaded["choice_feedback"]) == 4
+
+
+def test_migration_adds_choice_feedback_column():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        qcols = mcat_perf._existing_columns(store.conn, "perf_questions")
+        assert "choice_feedback" in qcols
+
+
+def test_cap_session_questions_limits_practice_pool():
+    qs = [
+        dict(SAMPLE_QUESTIONS[0], id=f"q_{i}", topic_id=f"t{i % 3}")
+        for i in range(30)
+    ]
+    capped = mcat_perf.cap_session_questions(
+        qs, session_mode=mcat_perf.SESSION_MODE_PRACTICE, rng=random.Random(0)
+    )
+    assert len(capped) == mcat_perf.DEFAULT_SESSION_CAP
+    assert len(capped) <= mcat_perf.MAX_SESSION_CAP
+
+
+def test_cap_session_questions_assessment_uses_held_out_only():
+    qs = [
+        dict(SAMPLE_QUESTIONS[0], id="dev1", split="dev"),
+        dict(SAMPLE_QUESTIONS[0], id="ho1", split="held_out"),
+        dict(SAMPLE_QUESTIONS[0], id="ho2", split="held_out"),
+    ]
+    capped = mcat_perf.cap_session_questions(
+        qs, session_mode=mcat_perf.SESSION_MODE_ASSESSMENT
+    )
+    assert {q["id"] for q in capped} <= {"ho1", "ho2"}
+
+
+def test_prepare_session_questions_blocked_orders_by_topic():
+    qs = [
+        {"id": "a", "topic_id": "t2", "split": "dev"},
+        {"id": "b", "topic_id": "t1", "split": "dev"},
+    ]
+    out = mcat_perf.prepare_session_questions(
+        qs, session_mode=mcat_perf.SESSION_MODE_PRACTICE, interleaved=False
+    )
+    assert [q["topic_id"] for q in out] == ["t1", "t2"]
+
+
+def test_session_resume_persists_index_and_pending_miss():
+    col = getEmptyCol()
+    q = dict(SAMPLE_QUESTIONS[0], cognitive_demand="application")
+    with PerfStore(col) as store:
+        store.upsert_questions([q])
+        qs = store.eligible_questions({"bb_citric_acid"})
+        key = mcat_perf.session_filter_key(
+            session_mode=mcat_perf.SESSION_MODE_PRACTICE, interleaved=False
+        )
+        sess = PerformanceSession(
+            store, qs, interleaved=False, filter_key=key, session_mode="practice"
+        )
+        wrong = (sess.correct_index() + 1) % 4
+        sess.answer(wrong, time_seconds=12.0)
+        assert sess.awaiting_error_type is True
+        saved = store.load_session_state(key)
+        assert saved is not None
+        assert saved["index"] == 0
+        assert saved["awaiting_error"] is True
+        assert saved["pending_choice"] == wrong
+
+        sess2 = PerformanceSession(
+            store,
+            qs,
+            interleaved=False,
+            filter_key=key,
+            session_mode="practice",
+            resume=saved,
+        )
+        assert sess2.index == 0
+        assert sess2.awaiting_error_type is True
+        assert sess2.pending_inference is not None
+
+
+def test_session_clear_state_on_finish():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions([SAMPLE_QUESTIONS[0]])
+        qs = store.eligible_questions({"bb_citric_acid"})
+        key = mcat_perf.session_filter_key(
+            session_mode=mcat_perf.SESSION_MODE_PRACTICE, interleaved=False
+        )
+        sess = PerformanceSession(
+            store, qs, interleaved=False, filter_key=key, session_mode="practice"
+        )
+        sess.answer(sess.correct_index())
+        sess.advance()
+        assert store.load_session_state(key) is None
+
+
+def test_accuracy_first_attempt_only_and_split_filter():
+    col = getEmptyCol()
+    dev_q = dict(SAMPLE_QUESTIONS[0], id="q_dev_x", split="dev")
+    ho_q = dict(SAMPLE_QUESTIONS[1], id="q_ho_x", split="held_out")
+    with PerfStore(col) as store:
+        store.upsert_questions([dev_q, ho_q])
+        store.log_attempt("q_dev_x", correct=False)
+        store.log_attempt("q_dev_x", correct=True)  # repeat — ignored by default
+        store.log_attempt("q_ho_x", correct=True)
+
+        headline = store.accuracy()
+        assert headline["attempts"] == 2
+        assert headline["correct"] == 1
+        assert abs(headline["accuracy"] - 0.5) < 1e-9
+
+        held = store.accuracy(split=mcat_perf.HELD_OUT_SPLIT)
+        assert held["attempts"] == 1
+        assert held["correct"] == 1
+
+
+def test_answer_churn_logged_in_feature_json():
+    col = getEmptyCol()
+    with PerfStore(col) as store:
+        store.upsert_questions([SAMPLE_QUESTIONS[0]])
+        qs = store.eligible_questions({"bb_citric_acid"})
+        sess = PerformanceSession(store, qs, interleaved=False)
+        wrong = (sess.correct_index() + 1) % 4
+        first = (wrong + 1) % 4
+        sess.answer(
+            wrong,
+            time_seconds=15.0,
+            first_choice_index=first,
+            answer_changes=2,
+        )
+        sess.classify_error("content_gap")
+        row = store.conn.execute(
+            "SELECT feature_json FROM perf_attempts"
+        ).fetchone()
+        feat = json.loads(row["feature_json"])
+        assert feat["first_choice_index"] == first
+        assert feat["answer_changes"] == 2
+
+
+def test_inferred_display_label_misread():
+    assert (
+        mcat_perf.inferred_display_label(mcat_perf.ERR_MISREAD) == "Careless read"
+    )
+
+
+def test_inferred_display_label_probe_pass_application():
+    label = mcat_perf.inferred_display_label(
+        mcat_perf.ERR_APPLICATION, probe_informed=True
+    )
+    assert label == mcat_perf.PROBE_PASS_REASONING_LABEL
+    assert mcat_perf.inferred_display_label(mcat_perf.ERR_APPLICATION) == "Applied reasoning"
+
+
+def test_session_probe_pass_recall_uses_application_display_label():
+    col = getEmptyCol()
+    q = dict(SAMPLE_QUESTIONS[0], cognitive_demand="recall")
+    with PerfStore(col) as store:
+        store.upsert_questions([q])
+        qs = store.eligible_questions({"bb_citric_acid"})
+        sess = PerformanceSession(store, qs, interleaved=False)
+        wrong = (sess.correct_index() + 1) % 4
+        sess.answer(wrong, time_seconds=20.0)
+        sess.record_probe_outcome(True, card_id=None)
+        assert sess.pending_inference["error_type"] == mcat_perf.ERR_APPLICATION
+        assert sess.inferred_display_label == mcat_perf.PROBE_PASS_REASONING_LABEL
 
 
 def test_session_application_practice_set_empty_without_pool():

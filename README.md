@@ -27,7 +27,11 @@ question bank is curated offline from named sources.
 - **Performance mode** (`pylib/anki/mcat_perf.py`, `qt/aqt/mcat/`) — a
   topic-gated MCQ session with self-reported error typing
   (content gap / passage mapping / reasoning / misread), stored in a local
-  **sidecar** database (`mcat_perf.db`) next to the collection.
+  **sidecar** database (`collection.mcat_perf.db`) next to the collection.
+  The sidecar deliberately does **not** ride stock Anki sync (a full sync would
+  wipe custom tables); performance data syncs cross-device via a portable,
+  uuid-deduped export/import bundle instead. Memory data (`revlog`/`cards`) still
+  uses stock Anki sync. See the companion repo's `docs/SYNC-CONFLICT-RULE.md`.
 - **Three-score dashboard** (`pylib/anki/mcat_scores.py`,
   `qt/aqt/deckbrowser.py`) — memory / performance / readiness, coverage %, and
   a single next action, embedded on Anki's home screen, plus a **Topic Mastery**

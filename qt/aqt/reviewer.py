@@ -682,6 +682,10 @@ class Reviewer:
             self.mw.onEditCurrent()
         elif url == "more":
             self.showContextMenu()
+        elif url == "mcatHome":
+            # MCAT: leave review and return to the deck browser dashboard.
+            # Safe mid-review or after answering — reviews are committed per-answer.
+            self.mw.moveToState("deckBrowser")
         elif url.startswith("play:"):
             play_clicked_audio(url, self.card)
         elif url.startswith("updateToolbar"):
@@ -815,6 +819,7 @@ class Reviewer:
 <table id=innertable width=100%% cellspacing=0 cellpadding=0>
 <tr>
 <td align=start valign=top class=stat>
+<button title="%(homekey)s" onclick="pycmd('mcatHome');">%(home)s</button>
 <button title="%(editkey)s" onclick="pycmd('edit');">%(edit)s</button></td>
 <td align=center valign=top id=middle>
 </td>
@@ -832,6 +837,8 @@ time = %(time)d;
 timerStopped = false;
 </script>
 """ % dict(
+            home="\u2190 Back to dashboard",
+            homekey="Return to the MCAT dashboard (deck browser)",
             edit=tr.studying_edit(),
             editkey=tr.actions_shortcut_key(val="E"),
             more=tr.studying_more(),

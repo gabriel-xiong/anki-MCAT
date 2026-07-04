@@ -17,14 +17,20 @@ from anki.mcat_perf import (
     MIN_CARDS_SEEN_FOR_PERFORMANCE,
     MIN_GOOD_OR_EASY_FOR_PERFORMANCE,
 )
-from anki.mcat_scores import topic_rows
+from anki.mcat_scores import (
+    section_display_name,
+    topic_display_name,
+    topic_rows,
+)
 from aqt.qt import (
     QAbstractItemView,
     QColor,
     QDialog,
     QDialogButtonBox,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
+    QPushButton,
     QTableWidget,
     QTableWidgetItem,
     Qt,
@@ -51,6 +57,16 @@ _UNLOCKED_FG = QColor("#1a7f37")
 _LOCKED_FG = QColor("#8a6d00")
 _CARS_FG = QColor("#4c7cf3")
 
+# Shared "return home" control styling for the MCAT dialogs. Uses palette()
+# roles so it adapts to Anki's light/dark themes without a token system, and
+# mirrors the top-left "← Back to dashboard" convention used by the embedded
+# performance view (outlined, rounded, subtle hover).
+_BACK_TO_DASHBOARD_QSS = (
+    "QPushButton { border: 1px solid palette(mid); border-radius: 8px; "
+    "padding: 6px 12px; font-weight: 600; } "
+    "QPushButton:hover { background: palette(midlight); }"
+)
+
 
 class MasteryDialog(QDialog):
     def __init__(self, mw: AnkiQt) -> None:
@@ -66,6 +82,17 @@ class MasteryDialog(QDialog):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+
+        # Discoverable, consistent "return home" control (top-left), matching the
+        # performance view and the other MCAT dialogs. Closing this modal dialog
+        # returns to the dashboard underneath — no teardown wiring needed.
+        top_row = QHBoxLayout()
+        back_button = QPushButton("← Back to dashboard")
+        back_button.setStyleSheet(_BACK_TO_DASHBOARD_QSS)
+        qconnect(back_button.clicked, self.reject)
+        top_row.addWidget(back_button)
+        top_row.addStretch()
+        root.addLayout(top_row)
 
         title = QLabel("Topic Mastery")
         title.setStyleSheet("font-size: 20px; font-weight: bold;")
@@ -143,7 +170,7 @@ class MasteryDialog(QDialog):
                 fg = _LOCKED_FG
 
             values = [
-                row["section"],
+                section_display_name(row["section"]),
                 row["name"],
                 str(row["cards_seen"]),
                 str(row["good_or_easy"]),
@@ -157,7 +184,7 @@ class MasteryDialog(QDialog):
                 if c in (2, 3, 4, 5, 6):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if c == 1:
-                    item.setToolTip(row["topic_id"])
+                    item.setToolTip(topic_display_name(row["topic_id"]))
                     f = item.font()
                     f.setBold(True)
                     item.setFont(f)

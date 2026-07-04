@@ -13,9 +13,16 @@ receiving device can reconstruct question context. No AI, no network.
 This is distinct from ``tools/mcat_export_perf.py`` (the read-only eval CSV/JSON
 export): a bundle is the *importable* interchange format.
 
+Memory calibration (ADDITIVE): pass ``--collection /path/collection.anki2`` to
+also embed the tester's raw ``revlog`` rows under ``memory_revlog`` (read-only),
+and ``--participant`` to embed a tester label under ``participant`` so
+attribution survives file renames/merges. The revlog can be fed to the
+memory-calibration harness via ``scripts/revlog_from_bundle.py`` (MCAT repo).
+
 Usage:
   python tools/mcat_export_bundle.py --db /path/collection.mcat_perf.db \
-      --out /path/collection.perf_bundle.json
+      --out /path/collection.perf_bundle.json \
+      [--collection /path/collection.anki2] [--participant AB]
 """
 
 from __future__ import annotations
@@ -33,16 +40,35 @@ def main() -> None:
     ap.add_argument(
         "--out", required=True, help="output bundle path (JSON)"
     )
+    ap.add_argument(
+        "--collection",
+        default=None,
+        help="optional collection.anki2 to embed revlog (memory calibration)",
+    )
+    ap.add_argument(
+        "--participant",
+        default=None,
+        help="optional tester label embedded in the bundle payload",
+    )
     args = ap.parse_args()
 
     if not os.path.exists(args.db):
         print(f"db not found: {args.db}", file=sys.stderr)
         sys.exit(2)
+    if args.collection is not None and not os.path.exists(args.collection):
+        print(f"collection not found: {args.collection}", file=sys.stderr)
+        sys.exit(2)
 
-    res = export_bundle(args.db, args.out)
+    res = export_bundle(
+        args.db,
+        args.out,
+        collection_path=args.collection,
+        participant=args.participant,
+    )
     print(
         f"exported sync bundle from {args.db}: "
-        f"{res['attempts']} attempts, {res['questions']} questions -> {args.out}"
+        f"{res['attempts']} attempts, {res['questions']} questions, "
+        f"{res['revlog']} revlog rows -> {args.out}"
     )
 
 
