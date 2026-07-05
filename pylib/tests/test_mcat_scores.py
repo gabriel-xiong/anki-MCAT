@@ -958,3 +958,28 @@ def test_memory_abstain_message_when_fsrs_disabled():
     assert "FSRS" in mem["reason"]
     assert f"0/{mem['started_cards']}" in mem["reason"]
     assert "Enable FSRS" in mem["reason"]
+
+
+def test_ensure_fsrs_for_memory_enables_collection_and_presets():
+    """Fresh collections default FSRS off; ensure_fsrs turns it on with 90% DR."""
+    from anki.config import Config
+
+    col = getEmptyCol()
+    assert not col.get_config("fsrs", False)
+    assert mcat_scores.ensure_fsrs_for_memory(col)
+    assert col.get_config("fsrs", False)
+    assert col.get_config_bool(Config.Bool.SCHED_2021)
+    conf = col.decks.config_dict_for_deck_id(1)
+    assert conf["desiredRetention"] == mcat_scores.FSRS_DESIRED_RETENTION
+    assert conf["fsrsParams6"] == []
+    # Idempotent second call.
+    assert mcat_scores.ensure_fsrs_for_memory(col)
+
+
+def test_dashboard_data_auto_enables_fsrs():
+    """Non-preseeded profiles get FSRS on first dashboard read (apkg/dev path)."""
+    col = getEmptyCol()
+    assert not col.get_config("fsrs", False)
+    with PerfStore(col):
+        mcat_scores.dashboard_data(col)
+    assert col.get_config("fsrs", False)

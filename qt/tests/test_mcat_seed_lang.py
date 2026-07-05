@@ -78,3 +78,20 @@ def test_seed_tool_sets_default_lang(tmp_path):
     assert _read_default_lang(base) == "en_US"
     assert (tmp_path / "MCAT-Speedrun" / "TESTER-QUICKSTART.md").exists()
     assert (tmp_path / "MCAT-Speedrun.zip").exists()
+
+    # Memory score needs FSRS on in the shipped base (see ensure_fsrs_for_memory).
+    sys.path.insert(0, str(_REPO / "pylib"))
+    sys.path.insert(0, str(_REPO / "out" / "pylib"))
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from anki.collection import Collection
+    from anki import mcat_scores
+
+    col_path = base / "User 1" / "collection.anki2"
+    col = Collection(str(col_path))
+    try:
+        assert col.get_config("fsrs", False)
+        conf = col.decks.config_dict_for_deck_id(1)
+        assert conf["desiredRetention"] == mcat_scores.FSRS_DESIRED_RETENTION
+        assert conf["fsrsParams6"] == []
+    finally:
+        col.close()
