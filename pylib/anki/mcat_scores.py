@@ -21,6 +21,7 @@ from anki.mcat_perf import (
     MIN_CARDS_SEEN_FOR_PERFORMANCE,
     MIN_GOOD_OR_EASY_FOR_PERFORMANCE,
     PerfStore,
+    card_retrievability,
     unlocked_topic_ids,
 )
 
@@ -352,6 +353,27 @@ def _deck_maturity(col: Collection) -> tuple[int, int, float]:
     return mature, started, maturity
 
 
+def _deck_retrievability(col: Collection) -> tuple[Optional[float], int]:
+    """Mean FSRS retrievability over all started cards with memory state.
+
+    Uses every reviewed card in the collection — not only ``topic:``-tagged
+    notes. Topic mastery is scoped to MCAT tags for performance unlock; Memory
+    must reflect the user's actual review history (including Default-deck cards).
+    Returns ``(avg, n_with_retrievability)``; ``avg`` is ``None`` when no card
+    has FSRS memory state (FSRS off, or nothing reviewed yet).
+    """
+    total = 0.0
+    count = 0
+    for (cid,) in col.db.all("select id from cards where reps > 0"):
+        r = card_retrievability(col, int(cid))
+        if r is not None:
+            total += r
+            count += 1
+    if count == 0:
+        return None, 0
+    return total / count, count
+
+
 def _memory_score(
     retrievability: Optional[float], maturity: float
 ) -> Optional[int]:
@@ -410,22 +432,9 @@ def memory_summary(col: Collection) -> dict[str, Any]:
     topics_studied = sum(1 for m in mastery if m.cards_seen > 0)
     unlocked = sum(1 for m in mastery if m.performance_unlocked)
 
-    # R = mean FSRS predicted retrievability over seen/reviewed cards. The Rust
-    # query returns per-topic means, so weight by cards_seen instead of giving a
-    # tiny topic the same influence as a large one.
-    retr_weight = sum(
-        m.cards_seen for m in mastery if m.avg_retrievability > 0 and m.cards_seen > 0
-    )
-    avg_retr = (
-        sum(
-            m.avg_retrievability * m.cards_seen
-            for m in mastery
-            if m.avg_retrievability > 0 and m.cards_seen > 0
-        )
-        / retr_weight
-        if retr_weight
-        else None
-    )
+    # R = mean FSRS predicted retrievability over all started cards (deck-wide,
+    # not topic-scoped — see _deck_retrievability).
+    avg_retr, retr_cards = _deck_retrievability(col)
 
     # Mat = card-level memory maturity (interval >= 21d), NOT exam coverage.
     mature_cards, started_cards, maturity = _deck_maturity(col)
@@ -442,7 +451,8 @@ def memory_summary(col: Collection) -> dict[str, Any]:
 
     # Headline + uncertainty band (widens at low card count via SE(R) ∝ 1/√n).
     score = _memory_score(avg_retr, mat_factor)
-    score_low, score_high = _memory_band(avg_retr, mat_factor, started_cards)
+    band_n = retr_cards if retr_cards > 0 else started_cards
+    score_low, score_high = _memory_band(avg_retr, mat_factor, band_n)
     mature_pct = round(100 * maturity)
 
     # Single authoritative status so the badge and headline can NEVER disagree.
@@ -461,9 +471,10 @@ def memory_summary(col: Collection) -> dict[str, Any]:
     score_displayable = review_gate_met and maturity_gate_met and score is not None
 
     if not review_gate_met:
+        need = max(0, MIN_MEMORY_REVIEWS - total_reviews)
         reason: Optional[str] = (
-            f"Needs ≥{MIN_MEMORY_REVIEWS} graded reviews "
-            f"(have {total_reviews})."
+            f"Need {need} more reviews "
+            f"(have {total_reviews}/{MIN_MEMORY_REVIEWS})."
         )
     elif REQUIRE_MEMORY_MATURITY and mature_cards == 0:
         # strict maturity blocker: with no mature cards the maturity factor is 0,
@@ -471,17 +482,24 @@ def memory_summary(col: Collection) -> dict[str, Any]:
         need = max(1, started_cards - mature_cards)
         reason = (
             f"Need {need} mature cards "
-            f"(interval ≥{MEMORY_MATURITY_INTERVAL_DAYS}d)."
+            f"(interval ≥{MEMORY_MATURITY_INTERVAL_DAYS}d; have {mature_cards})."
         )
     elif not maturity_gate_met:
         # tester floor blocker: review a few more cards for a stable estimate.
         need = max(1, MIN_STARTED_CARDS_FOR_MEMORY - started_cards)
         reason = (
-            f"Review {need} more {'card' if need == 1 else 'cards'} "
-            f"(have {started_cards})."
+            f"Need {need} more started cards "
+            f"(have {started_cards}/{MIN_STARTED_CARDS_FOR_MEMORY})."
         )
     elif score is None:
-        reason = "Need FSRS memory data."
+        if started_cards > 0 and retr_cards == 0:
+            reason = (
+                f"Need FSRS recall estimates "
+                f"(0/{started_cards} cards have data). "
+                f"Enable FSRS in deck options."
+            )
+        else:
+            reason = "Need FSRS memory data."
     else:
         reason = None
 
@@ -508,6 +526,7 @@ def memory_summary(col: Collection) -> dict[str, Any]:
         "mature_cards": mature_cards,
         "started_cards": started_cards,
         "mature_pct": mature_pct,
+        "retrievability_cards": retr_cards,
         "reason": reason,
     }
 
