@@ -342,6 +342,7 @@ def test_memory_summary_exposes_headline_band_and_abstains_when_empty():
     # Abstain gate still fires below MIN_MEMORY_REVIEWS.
     assert mem["status"] == "abstain"
     assert str(mcat_scores.MIN_MEMORY_REVIEWS) in mem["reason"]
+    assert f"have 0/{mcat_scores.MIN_MEMORY_REVIEWS}" in mem["reason"]
     # New headline + band fields present; None on an empty deck (no data).
     assert mem["memory_score"] is None
     assert mem["score_low"] is None and mem["score_high"] is None
@@ -895,3 +896,65 @@ def test_memory_computes_from_retrievability_without_maturity_at_tester_scale():
     assert mem["maturity_applied"] is False
     assert mem["provisional"] is True
     assert mem["score_low"] is not None and mem["score_high"] is not None
+
+
+def test_memory_scores_untagged_default_deck_cards():
+    """BUG: Memory abstained after a full Default-deck pass because retrievability
+    was computed only from topic:-tagged cards while review/card gates counted
+    the whole deck. Untagged reviewed cards must contribute."""
+    if mcat_scores.REQUIRE_MEMORY_MATURITY:  # pragma: no cover
+        import pytest
+
+        pytest.skip("strict profile requires maturity")
+
+    from anki.config import Config
+
+    col = getEmptyCol()
+    if col.sched_ver() != 2:
+        col.upgrade_to_v2_scheduler()
+    col.set_config_bool(Config.Bool.SCHED_2021, True)
+    col.set_config("fsrs", True)
+    col._load_scheduler()
+
+    n = mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY + 3
+    for i in range(n):
+        note = col.newNote()
+        note["Front"] = f"default deck card {i}"
+        # Deliberately NO topic: tag — mirrors the shipped Default deck.
+        col.addNote(note)
+    for _ in range(n):
+        c = col.sched.getCard()
+        assert c is not None
+        col.sched.answerCard(c, 3)
+
+    assert col.get_topic_mastery() == []
+    mem = mcat_scores.memory_summary(col)
+    assert mem["total_reviews"] >= n
+    assert mem["started_cards"] >= mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY
+    assert mem["retrievability_cards"] >= mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY
+    assert mem["avg_retrievability"] is not None and mem["avg_retrievability"] > 0
+    assert mem["status"] == "measured"
+    assert mem["memory_score"] is not None
+    assert mem["score_available"] is True
+
+
+def test_memory_abstain_message_when_fsrs_disabled():
+    """When reviews exist but FSRS is off, the blocker must name FSRS explicitly."""
+    col = getEmptyCol()
+    n = mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY + 2
+    for i in range(n):
+        note = col.newNote()
+        note["Front"] = f"card {i}"
+        col.addNote(note)
+    for _ in range(n):
+        c = col.sched.getCard()
+        assert c is not None
+        col.sched.answerCard(c, 3)
+
+    mem = mcat_scores.memory_summary(col)
+    assert mem["started_cards"] >= mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY
+    assert mem["retrievability_cards"] == 0
+    assert mem["status"] == "abstain"
+    assert "FSRS" in mem["reason"]
+    assert f"0/{mem['started_cards']}" in mem["reason"]
+    assert "Enable FSRS" in mem["reason"]
