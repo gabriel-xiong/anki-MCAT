@@ -61,6 +61,35 @@ def set_ai_toggle_enabled(enabled: bool) -> None:
     except Exception:
         pass
 
+
+def ai_toggle_display_state() -> dict[str, bool | str]:
+    """Honest AI toggle label/state for dashboard and performance UI.
+
+    The pill shows "AI: On" ONLY when the user toggle is on AND a live backend
+    is configured. Three states:
+      * toggle off              -> "AI: Off"
+      * on + backend configured -> "AI: On"
+      * on + NOT configured     -> "AI: Not set up"
+    """
+    pref_on = ai_toggle_enabled()
+    try:
+        configured = ai_provider_configured()
+    except Exception:
+        configured = False
+    effective_on = pref_on and configured
+    if not pref_on:
+        label = "AI: Off"
+    elif configured:
+        label = "AI: On"
+    else:
+        label = "AI: Not set up"
+    return {
+        "label": label,
+        "pref_on": pref_on,
+        "configured": configured,
+        "effective_on": effective_on,
+    }
+
 # ``correct_path`` from the explainer always opens with a "The correct answer
 # is …." sentence, which just restates the header. Match it so we can drop the
 # duplicate while keeping any actionable guidance that follows.

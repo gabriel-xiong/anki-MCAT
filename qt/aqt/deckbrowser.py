@@ -168,6 +168,10 @@ class DeckBrowser:
             from aqt.mcat import export_my_data
 
             export_my_data(self.mw)
+        elif cmd == "mcat_ai_toggle":
+            from aqt.mcat import toggle_ai_enabled
+
+            toggle_ai_enabled(self.mw)
         return False
 
     def set_current_deck(self, deck_id: DeckId) -> None:
@@ -721,6 +725,25 @@ def _mcat_focus_html(focus: dict[str, Any] | None) -> str:
 </div>"""
 
 
+def _mcat_ai_toggle_html() -> str:
+    """Prominent dashboard pill — same honest states as the performance header."""
+    from aqt.mcat.ai_bridge import ai_toggle_display_state
+
+    st = ai_toggle_display_state()
+    css_class = (
+        "mcat-ai-toggle-on" if st["effective_on"] else "mcat-ai-toggle-off"
+    )
+    tip = (
+        "Turn the AI assistant on or off. When off, explanations use the "
+        "offline, source-grounded fallback."
+    )
+    return (
+        f'<button type="button" class="mcat-ai-toggle {css_class}" '
+        f'onclick=\'pycmd("mcat_ai_toggle")\' '
+        f'title="{html.escape(tip)}">{html.escape(str(st["label"]))}</button>'
+    )
+
+
 def _mcat_dashboard_html(data: dict[str, Any]) -> str:
     from anki import mcat_scores
 
@@ -862,7 +885,8 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
         # read like the blocker (the real blockers live in the gate note below).
         blockers = str(read["reason"] or "").split("; ")
         read_sub = (
-            f"Need {mcat_scores.MIN_COVERAGE_PCT}% coverage"
+            f"Need {mcat_scores.MIN_COVERAGE_PCT}% exam outline coverage "
+            f"(have {cov_pct_r}%)"
             if cov_pct_r < mcat_scores.MIN_COVERAGE_PCT
             else (blockers[0].replace("<", "under") if blockers else "Need more data")
         )
@@ -884,6 +908,11 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
     )
 
     cov_pct = cov["pct"]
+    outline_label = (
+        f"Exam outline coverage: {cov['pct']}% "
+        f"({cov['covered']}/{cov['total']} topics in deck)"
+    )
+    ai_toggle_html = _mcat_ai_toggle_html()
     return f"""
 <style>
 .mcat-dash {{
@@ -891,11 +920,33 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
   text-align: start; font-size: 14px;
 }}
 .mcat-dash-head {{
-  display: flex; align-items: baseline; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
   margin-bottom: 7px;
+}}
+.mcat-dash-head-left {{
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  min-width: 0;
 }}
 .mcat-dash-title {{ font-size: 15px; font-weight: 700; }}
 .mcat-dash-sub {{ color: var(--fg-subtle, #888); font-size: 11px; }}
+.mcat-ai-toggle {{
+  font: inherit; font-size: 11px; font-weight: 700; line-height: 1.2;
+  padding: 4px 12px; border-radius: 999px; cursor: pointer;
+  background: transparent; flex-shrink: 0;
+}}
+.mcat-ai-toggle-on {{
+  color: #4c7cf3; border: 1.5px solid #4c7cf3;
+}}
+.mcat-ai-toggle-on:hover {{
+  background: rgba(76,124,243,0.08);
+}}
+.mcat-ai-toggle-off {{
+  color: var(--fg-subtle, #888); border: 1.5px solid var(--border, #e4e4e7);
+}}
+.mcat-ai-toggle-off:hover {{
+  color: #4c7cf3; border-color: #4c7cf3;
+}}
 .mcat-cards {{ display: flex; gap: 12px; flex-wrap: wrap; }}
 .mcat-card {{
   flex: 1 1 0; min-width: 200px; border: 1px solid var(--border, #e4e4e7);
@@ -955,6 +1006,8 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
   width: {cov_pct}%; box-shadow: 0 1px 2px rgba(43,182,115,0.35); }}
 .mcat-cover-label {{ font-size: 12.5px; font-weight: 600;
   color: var(--fg-subtle, #888); }}
+.mcat-cover-label-secondary {{ display: block; font-size: 11.5px; font-weight: 500;
+  margin-top: 2px; opacity: .85; }}
 .mcat-focus {{ margin-top: 12px; display: flex; align-items: center;
   justify-content: space-between; gap: 14px; flex-wrap: wrap;
   border: 1px solid var(--border, #e4e4e7); border-left: 4px solid #f5a623;
@@ -990,8 +1043,11 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
 </style>
 <div class="mcat-dash">
   <div class="mcat-dash-head">
-    <span class="mcat-dash-title">MCAT Speedrun</span>
-    <span class="mcat-dash-sub">three separate scores · never blended</span>
+    <div class="mcat-dash-head-left">
+      <span class="mcat-dash-title">MCAT Speedrun</span>
+      <span class="mcat-dash-sub">three separate scores · never blended</span>
+    </div>
+    {ai_toggle_html}
   </div>
   <div class="mcat-cards">
     {mem_card}
@@ -1000,7 +1056,7 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
   </div>
   {focus_html}
   <div class="mcat-cover-wrap">
-    <span class="mcat-cover-label">Coverage: {cov['measured']}/{cov['total']} topics measured ({cov_pct}%)</span>
+    <span class="mcat-cover-label">{outline_label}</span>
     <div class="mcat-cover-bar"><div class="mcat-cover-fill"></div></div>
   </div>
   <div class="mcat-secondary-row">

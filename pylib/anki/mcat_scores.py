@@ -66,8 +66,8 @@ _STRICT_THRESHOLDS = {
 _TESTER_THRESHOLDS = {
     "min_memory_reviews": 10,
     "min_perf_attempts": 8,
-    # Coverage unchanged: the 3-topic shipped scope already makes 2/3 = 66%
-    # reachable, so 50% is honest AND attainable in one short sitting.
+    # Content coverage uses the full AAMC exam outline denominator; prototype
+    # deck/bank covers a tiny fraction — Readiness correctly abstains (<50%).
     "min_coverage_pct": 50,
     "min_attempts_per_science_section": 3,
     "min_cars_attempts": 3,
@@ -153,8 +153,10 @@ READINESS_CONF_LOW_MAX = 40  # < 40 -> "low"
 READINESS_CONF_HIGH_MIN = 70  # >= 70 -> "high"; in between -> "moderate"
 
 # ---------------------------------------------------------------------------
-# Outline — coverage denominator. Mirrors data/mcat-outline.v1.json (v1-subset).
-# Keep in sync if that file changes. (section_id, topic_id, name)
+# Prototype v1 scope — shipped content + topic mastery UI. Mirrors
+# data/mcat-outline.v1.json (~18 coarse topics). NOT the coverage denominator;
+# see EXAM_OUTLINE below (DECISIONS §2, PRD §6.5 C-1).
+# (section_id, topic_id, name)
 # ---------------------------------------------------------------------------
 OUTLINE: list[tuple[str, str, str]] = [
     ("CP", "cp_electrochem", "Electrochemistry"),
@@ -177,9 +179,73 @@ OUTLINE: list[tuple[str, str, str]] = [
     ("PS", "ps_demographics", "Demographics and Health Disparities"),
 ]
 OUTLINE_TOPIC_IDS = {t for _, t, _ in OUTLINE}
+TOTAL_TOPICS = len(OUTLINE)
+
+# ---------------------------------------------------------------------------
+# Full exam outline — coverage denominator ONLY. Mirrors
+# MCAT/data/mcat-outline.full.json (full-aamc-v1). Prototype v1 OUTLINE above
+# is the shipped content scope for topic_rows / mastery UI — NOT the coverage
+# denominator.
+# ---------------------------------------------------------------------------
+EXAM_OUTLINE: list[tuple[str, str, str]] = [
+    ("CP", "cp_electrochem", "Electrochemistry"),
+    ("CP", "cp_acids_bases", "Acids, Bases, and Buffers"),
+    ("CP", "cp_thermo", "Thermodynamics and Spontaneity"),
+    ("CP", "cp_kinetics", "Chemical Kinetics"),
+    ("CP", "cp_fluids", "Fluids and Circulation (physics)"),
+    ("CP", "aamc_cp_4a", "Translational motion, forces, work, energy, and equilibrium"),
+    ("CP", "aamc_cp_4b", "Fluids for blood circulation, gas movement, and gas exchange"),
+    ("CP", "aamc_cp_4c", "Electrochemistry and electrical circuits"),
+    ("CP", "aamc_cp_4d", "How light and sound interact with matter"),
+    ("CP", "aamc_cp_4e", "Atoms, nuclear decay, electronic structure, and atomic behavior"),
+    ("CP", "aamc_cp_5a", "Unique nature of water and its solutions"),
+    ("CP", "aamc_cp_5b", "Nature of molecules and intermolecular interactions"),
+    ("CP", "aamc_cp_5c", "Separation and purification methods"),
+    ("CP", "aamc_cp_5d", "Structure, function, and reactivity of biologically relevant molecules"),
+    ("CP", "aamc_cp_5e", "Principles of chemical thermodynamics and kinetics"),
+    ("CARS", "cars_comprehension", "Foundations of Comprehension"),
+    ("CARS", "cars_reasoning_within", "Reasoning Within the Text"),
+    ("CARS", "cars_reasoning_beyond", "Reasoning Beyond the Text"),
+    ("BB", "bb_glycolysis", "Glycolysis and Glucose Metabolism"),
+    ("BB", "bb_citric_acid", "Citric Acid Cycle and Oxidative Phosphorylation"),
+    ("BB", "bb_enzymes", "Enzyme Kinetics and Regulation"),
+    ("BB", "bb_membranes", "Membrane Structure and Transport"),
+    ("BB", "bb_dna", "DNA Structure and Replication"),
+    ("BB", "bb_genetics", "Mendelian Genetics and Inheritance"),
+    ("BB", "aamc_bb_1a", "Structure and function of proteins and amino acids"),
+    ("BB", "aamc_bb_1b", "Transmission of genetic information from gene to protein"),
+    ("BB", "aamc_bb_1c", "Transmission of heritable information and genetic diversity"),
+    ("BB", "aamc_bb_1d", "Principles of bioenergetics and fuel molecule metabolism"),
+    ("BB", "aamc_bb_2a", "Assemblies of molecules, cells, and groups of cells"),
+    ("BB", "aamc_bb_2b", "Structure, growth, physiology, and genetics of prokaryotes and viruses"),
+    ("BB", "aamc_bb_2c", "Processes of cell division, differentiation, and specialization"),
+    ("BB", "aamc_bb_3a", "Nervous and endocrine systems and organ coordination"),
+    ("BB", "aamc_bb_3b", "Structure and integrative functions of main organ systems"),
+    ("PS", "ps_memory", "Memory and Cognition"),
+    ("PS", "ps_learning", "Learning and Conditioning"),
+    ("PS", "ps_social", "Social Processes and Behavior"),
+    ("PS", "ps_demographics", "Demographics and Health Disparities"),
+    ("PS", "aamc_ps_6a", "Sensing the environment"),
+    ("PS", "aamc_ps_6b", "Making sense of the environment"),
+    ("PS", "aamc_ps_6c", "Responding to the world"),
+    ("PS", "aamc_ps_7a", "Individual influences on behavior"),
+    ("PS", "aamc_ps_7b", "Social processes that influence human behavior"),
+    ("PS", "aamc_ps_7c", "Attitude and behavior change"),
+    ("PS", "aamc_ps_8a", "Self-identity"),
+    ("PS", "aamc_ps_8b", "Social thinking"),
+    ("PS", "aamc_ps_8c", "Social interactions"),
+    ("PS", "aamc_ps_9a", "Understanding social structure"),
+    ("PS", "aamc_ps_9b", "Demographic characteristics and processes"),
+    ("PS", "aamc_ps_10a", "Social inequality"),
+]
+EXAM_OUTLINE_TOPIC_IDS = {t for _, t, _ in EXAM_OUTLINE}
+TOTAL_EXAM_TOPICS = len(EXAM_OUTLINE)
+
 SECTION_OF_TOPIC = {t: s for s, t, _ in OUTLINE}
 NAME_OF_TOPIC = {t: n for _, t, n in OUTLINE}
-TOTAL_TOPICS = len(OUTLINE)
+for _sec, _tid, _name in EXAM_OUTLINE:
+    SECTION_OF_TOPIC.setdefault(_tid, _sec)
+    NAME_OF_TOPIC.setdefault(_tid, _name)
 
 # Section code -> full section title. Mirrors data/mcat-outline.v1.json
 # sections[].name. Keep in sync if that file changes.
@@ -616,36 +682,52 @@ def shipped_scope_sections(store: PerfStore) -> set[str]:
 
 
 # ---------------------------------------------------------------------------
-# Coverage
+# Coverage — content scope vs full outline (PRD §6.5 C-1–C-4, DECISIONS §2).
+# NOT user study progress (cards_seen / perf attempts are separate gates).
 # ---------------------------------------------------------------------------
-def coverage_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
-    """Fraction of the SHIPPED-scope topics with measurement (cards seen or
-    scored attempts). The denominator is the topics this build ships questions
-    for (see ``shipped_scope_topics``), so a 3-topic tester is measured against
-    3 — unlocking 2 of 3 is 66% (≥ the 50% Readiness gate)."""
-    scope = shipped_scope_topics(store)
-    measured: set[str] = set()
-    for m in col.get_topic_mastery():
-        if m.cards_seen > 0 and m.topic_id in scope:
-            measured.add(m.topic_id)
-    # IDK ("Not sure") rows are abstentions, not scored engagement — exclude
-    # them so a topic answered only with "Not sure" does NOT count toward
-    # Readiness coverage. Mirrors accuracy()'s ``a.idk = 0`` filter.
-    for row in store.conn.execute(
-        "SELECT DISTINCT q.topic_id FROM perf_attempts a "
-        "JOIN perf_questions q ON q.id = a.question_id "
-        "WHERE a.idk = 0"
-    ):
-        if row["topic_id"] in scope:
-            measured.add(row["topic_id"])
+def _content_covered_topics(col: Collection, store: PerfStore) -> set[str]:
+    """Outline topics where shipped content actually covers them.
 
-    total = len(scope)
-    pct = round(100 * len(measured) / total) if total else 0
+    A topic counts when the deck has tagged cards for it (``cards_total > 0``)
+    OR the question bank has ≥1 question for ``topic_id``. User activity does
+    not affect this set."""
+    covered: set[str] = set()
+    mastery = {m.topic_id: m for m in col.get_topic_mastery()}
+    question_topics = {
+        row["topic_id"]
+        for row in store.conn.execute("SELECT DISTINCT topic_id FROM perf_questions")
+    }
+    for topic_id in EXAM_OUTLINE_TOPIC_IDS:
+        m = mastery.get(topic_id)
+        has_cards = m is not None and m.cards_total > 0
+        has_questions = topic_id in question_topics
+        if has_cards or has_questions:
+            covered.add(topic_id)
+    return covered
+
+
+def coverage_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
+    """Content coverage: exam-outline topics with deck cards and/or bank questions.
+
+    Denominator: full AAMC exam outline (``TOTAL_EXAM_TOPICS``). Numerator:
+    topics where shipped content exists (``cards_total > 0`` or bank question).
+    NOT user study progress. Drives the dashboard bar and Readiness abstain
+    gate (≥50%)."""
+    covered = _content_covered_topics(col, store)
+    total = TOTAL_EXAM_TOPICS
+    pct = round(100 * len(covered) / total) if total else 0
+    covered_sorted = sorted(covered)
     return {
-        "measured": len(measured),
+        "covered": len(covered),
         "total": total,
         "pct": pct,
-        "measured_topics": sorted(measured),
+        "covered_topics": covered_sorted,
+        # Aliases for readiness_summary / legacy consumers.
+        "outline_measured": len(covered),
+        "outline_total": total,
+        "outline_pct": pct,
+        "measured": len(covered),
+        "measured_topics": covered_sorted,
     }
 
 
@@ -723,8 +805,11 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
         reasons.append(f"reviews < {MIN_MEMORY_REVIEWS}")
     if perf["attempts"] < MIN_PERF_ATTEMPTS:
         reasons.append(f"attempts < {MIN_PERF_ATTEMPTS}")
-    if cov["pct"] < MIN_COVERAGE_PCT:
-        reasons.append(f"coverage < {MIN_COVERAGE_PCT}%")
+    exam_cov_pct = cov["pct"]
+    if exam_cov_pct < MIN_COVERAGE_PCT:
+        reasons.append(
+            f"exam outline coverage {exam_cov_pct}% < {MIN_COVERAGE_PCT}%"
+        )
     for sec in SCIENCE_SECTIONS:
         if (
             sec in shipped_sections
@@ -740,24 +825,23 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
     if reasons:
         return {
             "status": "abstain",
-            "coverage_pct": cov["pct"],
+            "coverage_pct": exam_cov_pct,
             "reason": "; ".join(reasons),
             "range": None,
         }
 
     # Eligible — provisional map (coefficients deferred). The range WIDENS when
     # the performance sample is small (honest: fewer attempts -> noisier section
-    # accuracy -> a less certain mapped score), so a friend-tester's small-n
-    # Readiness visibly reads as rough. Attach a numeric confidence summarizing
-    # how well-supported the range is (coverage, attempts, range width) — NOT a
-    # blend of the other two scores.
+    # accuracy -> a less certain mapped score). Attach a numeric confidence
+    # summarizing how well-supported the range is (coverage, attempts, range
+    # width) — NOT a blend of the other two scores.
     low, high = _provisional_range(store, perf["attempts"])
     confidence_score = _readiness_confidence(
-        cov["pct"] / 100.0, perf["attempts"], high - low
+        exam_cov_pct / 100.0, perf["attempts"], high - low
     )
     return {
         "status": "ok",
-        "coverage_pct": cov["pct"],
+        "coverage_pct": exam_cov_pct,
         "reason": None,
         "range": [low, high],
         # numeric 0-100 confidence (headline detail). Bucket label kept as a

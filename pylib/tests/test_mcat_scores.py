@@ -41,10 +41,10 @@ def test_empty_collection_abstains_everywhere():
     assert data["performance"]["status"] == "abstain"
     assert data["readiness"]["status"] == "abstain"
     assert data["readiness"]["range"] is None
-    # Coverage denominator is the SHIPPED scope (topics with questions in the
-    # sidecar). An empty collection ships no bank, so the scope is empty.
-    assert data["coverage"]["total"] == 0
-    assert data["coverage"]["measured"] == 0
+    # Coverage: full AAMC exam outline denominator; no content until loaded.
+    assert data["coverage"]["total"] == mcat_scores.TOTAL_EXAM_TOPICS
+    assert data["coverage"]["covered"] == 0
+    assert data["coverage"]["pct"] == 0
 
 
 def test_next_action_without_attempts_points_to_memory():
@@ -54,20 +54,33 @@ def test_next_action_without_attempts_points_to_memory():
     assert "memory" in msg.lower() or "unlock" in msg.lower()
 
 
-def test_coverage_counts_topics_with_attempts():
+def test_coverage_counts_content_topics_not_user_activity():
+    """Coverage = shipped content scope, NOT cards_seen or perf attempts."""
     col = getEmptyCol()
     with PerfStore(col) as store:
         store.upsert_questions(QUESTIONS)
+        # Attempt only one of two bank topics — content coverage still counts both.
         store.log_attempt("q1", correct=True)
-        store.log_attempt("q2", correct=False, error_type="reasoning")
 
         cov = mcat_scores.coverage_summary(col, store)
-        assert cov["measured"] == 2
-        assert set(cov["measured_topics"]) == {"bb_citric_acid", "cp_acids_bases"}
-        # Denominator = shipped scope (the 2 topics with questions), not the full
-        # 18-topic outline. Both topics measured -> 100%.
-        assert cov["total"] == 2
-        assert cov["pct"] == 100
+        assert set(cov["covered_topics"]) == {"bb_citric_acid", "cp_acids_bases"}
+        assert cov["covered"] == 2
+        assert cov["total"] == mcat_scores.TOTAL_EXAM_TOPICS
+        assert cov["pct"] == round(100 * 2 / mcat_scores.TOTAL_EXAM_TOPICS)
+
+
+def test_coverage_includes_deck_cards_without_questions():
+    col = getEmptyCol()
+    for i in range(2):
+        note = col.newNote()
+        note["Front"] = f"glycolysis {i}"
+        note.tags = ["topic:bb_glycolysis"]
+        col.addNote(note)
+    with PerfStore(col) as store:
+        cov = mcat_scores.coverage_summary(col, store)
+    assert "bb_glycolysis" in cov["covered_topics"]
+    assert cov["covered"] == 1
+    assert cov["pct"] == round(100 / mcat_scores.TOTAL_EXAM_TOPICS)
 
 
 def test_next_action_uses_most_common_error_type():
@@ -575,12 +588,9 @@ def test_readiness_summary_abstains_without_confidence_number():
 def test_idk_rows_are_invisible_to_readiness():
     """"Not sure" (IDK) abstentions contribute NO signal to Readiness.
 
-    Guards the three direct ``perf_attempts`` reads in this module that must
-    each filter ``idk = 0`` (mirroring accuracy()/idk_count() in mcat_perf):
-    coverage_summary, _section_attempt_counts, and _provisional_range. An IDK
-    row is logged (correct=0, content_gap route) so the focus area still sees
-    it, but it must move neither coverage, nor the provisional range, nor the
-    section attempt counts.
+    Guards the direct ``perf_attempts`` reads in this module that must each
+    filter ``idk = 0``: _section_attempt_counts and _provisional_range. Coverage
+    is content-scope (deck/bank), so IDK attempts never affect it.
     """
     col = getEmptyCol()
     # q1 -> bb_citric_acid/BB, q2 -> cp_acids_bases/CP (from QUESTIONS). q3 is a
@@ -607,9 +617,7 @@ def test_idk_rows_are_invisible_to_readiness():
         baseline_sections = mcat_scores._section_attempt_counts(store)
         baseline_range = mcat_scores._provisional_range(store)
 
-        # Flood "Not sure" abstentions: extra IDK on the graded topics PLUS a
-        # topic (ps_memory) whose only engagement is IDK. Non-CARS IDK routes
-        # to content_gap and is stored correct=0.
+        # Flood "Not sure" abstentions on graded topics.
         for _ in range(5):
             store.log_attempt("q1", correct=False, error_type="content_gap", idk=True)
             store.log_attempt("q2", correct=False, error_type="content_gap", idk=True)
@@ -623,25 +631,23 @@ def test_idk_rows_are_invisible_to_readiness():
         # filters exclude them, not that logging silently dropped the rows.
         assert store.idk_count() == 15
 
-    # IDK moves NONE of the three Readiness inputs.
+    # Content coverage unchanged by IDK (all three bank topics still covered).
     assert after_cov == baseline_cov
     assert after_sections == baseline_sections
     assert after_range == baseline_range
 
-    # Concretely: the IDK-only topic/section never becomes "measured", and the
-    # graded baseline actually carried signal (equality isn't comparing empties).
-    assert set(baseline_cov["measured_topics"]) == {"bb_citric_acid", "cp_acids_bases"}
-    assert "ps_memory" not in after_cov["measured_topics"]
-    assert "PS" not in after_sections
+    assert set(baseline_cov["covered_topics"]) == {
+        "bb_citric_acid",
+        "cp_acids_bases",
+        "ps_memory",
+    }
     assert baseline_sections.get("BB") == 2
     assert baseline_sections.get("CP") == 1
+    assert "PS" not in baseline_sections
 
 
 # ---------------------------------------------------------------------------
-# Scoped tester build — coverage denominator + Readiness section gates follow
-# the SHIPPED bank, so a 3-topic build can actually reach ≥50% coverage and
-# compute Readiness (it is not judged against the full 18-topic / 4-section
-# outline it does not ship).
+# Content coverage — outline denominator, deck/bank numerator (PRD §6.5 C-1–C-4).
 # ---------------------------------------------------------------------------
 # A 3-topic CP+BB bank, exactly like the shipped tester (eval trio).
 SCOPED_BANK = [
@@ -691,49 +697,50 @@ def _flood_reviews(col, n: int) -> None:
     )
 
 
-def test_coverage_denominator_is_shipped_scope_not_full_outline():
+def test_exam_outline_has_forty_nine_topics():
+    assert mcat_scores.TOTAL_EXAM_TOPICS == 49
+    assert mcat_scores.TOTAL_TOPICS == 18
+    assert mcat_scores.OUTLINE_TOPIC_IDS <= mcat_scores.EXAM_OUTLINE_TOPIC_IDS
+
+
+def test_coverage_three_topic_bank_is_six_percent():
+    """Prototype 3-topic bank → 3/49 ≈ 6% content coverage (not user progress)."""
     col = getEmptyCol()
     with PerfStore(col) as store:
         store.upsert_questions(SCOPED_BANK)
-        # scope = 3 shipped topics; measure 2 of them via scored attempts
-        store.log_attempt("sc_acids", correct=True)
-        store.log_attempt("sc_enzymes", correct=False, error_type="content_gap")
         cov = mcat_scores.coverage_summary(col, store)
 
-    assert cov["total"] == 3  # NOT 18
-    assert cov["measured"] == 2
-    # 2 of 3 = 66% clears the 50% Readiness coverage gate (17% under the full
-    # outline would not).
-    assert cov["pct"] == round(100 * 2 / 3)
-    assert cov["pct"] >= mcat_scores.MIN_COVERAGE_PCT
+    assert cov["covered"] == 3
+    assert cov["total"] == mcat_scores.TOTAL_EXAM_TOPICS
+    assert cov["pct"] == round(100 * 3 / mcat_scores.TOTAL_EXAM_TOPICS)
+    assert cov["pct"] == 6
+    assert cov["pct"] < mcat_scores.MIN_COVERAGE_PCT
 
 
-def test_readiness_computes_for_scoped_bank_without_all_sections():
-    """The whole point of the scope change: a CP+BB-only tester build can
-    COMPUTE Readiness once its own gates clear — the absent PS/CARS sections must
-    NOT block it forever."""
+def test_readiness_abstains_on_content_coverage_for_scoped_bank():
+    """3-topic bank ≈ 6% exam outline coverage → Readiness abstains (<50%)."""
     col = getEmptyCol()
     _flood_reviews(col, mcat_scores.MIN_MEMORY_REVIEWS + 5)
     with PerfStore(col) as store:
-        # 3-topic scope; a 3rd topic ships questions but stays unattempted so
-        # coverage is 2/3 = 66% (proves 2-of-3 clears the 50% gate).
         store.upsert_questions(
             _topic_questions("cp_acids_bases", "CP", 20, "rc_cp")
             + _topic_questions("bb_enzymes", "BB", 15, "rc_bb")
             + _topic_questions("cp_kinetics", "CP", 3, "rc_k")
         )
         for q in _topic_questions("cp_acids_bases", "CP", 20, "rc_cp"):
-            store.log_attempt(q["id"], correct=True)  # CP, 20 distinct
+            store.log_attempt(q["id"], correct=True)
         for q in _topic_questions("bb_enzymes", "BB", 15, "rc_bb"):
-            store.log_attempt(q["id"], correct=True)  # BB, 15 distinct
+            store.log_attempt(q["id"], correct=True)
         read = mcat_scores.readiness_summary(col, store)
         cov = mcat_scores.coverage_summary(col, store)
 
-    assert cov["total"] == 3 and cov["measured"] == 2  # 66% coverage
-    assert read["status"] == "ok", read.get("reason")
-    assert read["range"] is not None
-    assert read["coverage_pct"] >= mcat_scores.MIN_COVERAGE_PCT
-    assert read.get("confidence_score") is not None
+    assert cov["covered"] == 3
+    assert cov["pct"] == 6
+    assert cov["pct"] < mcat_scores.MIN_COVERAGE_PCT
+    assert read["status"] == "abstain"
+    assert read["range"] is None
+    assert "exam outline coverage" in read["reason"]
+    assert read["coverage_pct"] == cov["pct"]
 
 
 def test_readiness_still_enforces_shipped_section_gaps():
@@ -748,7 +755,7 @@ def test_readiness_still_enforces_shipped_section_gaps():
             + _topic_questions("cp_kinetics", "CP", 15, "rs_k")
             + _topic_questions("bb_enzymes", "BB", 3, "rs_bb")  # shipped, unattempted
         )
-        # 35 distinct attempts but ALL in CP; coverage 2/3, attempts gate cleared.
+        # 35 distinct attempts but ALL in CP; content coverage 3/49 ≈ 6%.
         for q in _topic_questions("cp_acids_bases", "CP", 20, "rs_cp"):
             store.log_attempt(q["id"], correct=True)
         for q in _topic_questions("cp_kinetics", "CP", 15, "rs_k"):
@@ -757,11 +764,8 @@ def test_readiness_still_enforces_shipped_section_gaps():
 
     assert read["status"] == "abstain"
     assert read["range"] is None
-    # The ONLY blocker is the missing BB attempts — NOT attempts/coverage, and
-    # NOT PS/CARS (not shipped -> not gated). Wording tracks the active gate.
-    assert read["reason"] == (
-        f"BB attempts < {mcat_scores.MIN_ATTEMPTS_PER_SCIENCE_SECTION}"
-    )
+    assert f"BB attempts < {mcat_scores.MIN_ATTEMPTS_PER_SCIENCE_SECTION}" in read["reason"]
+    assert "exam outline coverage" in read["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -804,40 +808,37 @@ def test_perf_credible_interval_is_very_wide_at_tester_gate():
     assert (hi - lo) * 100 >= 30
 
 
-def test_readiness_computes_with_provisional_fields_and_wide_range():
-    """Short-session friend-tester data clears the low gates and Readiness
-    COMPUTES — carrying the mandatory honesty fields (range, coverage %, a
-    confidence number, a provisional/missing-data note, and a next action) with
-    a visibly wide range at small n."""
+def test_readiness_abstains_for_full_v1_bank_on_exam_outline():
+    """Even the full v1 prototype bank (18 topics) is only 18/49 — Readiness abstains."""
     col = getEmptyCol()
-    _flood_reviews(col, mcat_scores.MIN_MEMORY_REVIEWS + 2)
+    _flood_reviews(col, mcat_scores.MIN_MEMORY_REVIEWS + 5)
+    full_bank = [
+        {
+            "id": f"q_{topic}",
+            "stem": f"{topic} question.",
+            "choices": ["a", "b", "c", "d"],
+            "correct": "A",
+            "topic_id": topic,
+            "section": section,
+            "source_name": "OpenStax",
+            "split": "dev",
+        }
+        for section, topic, _ in mcat_scores.OUTLINE
+    ]
     with PerfStore(col) as store:
-        # ~8-12 questions across 2 topics (one per shipped science section),
-        # clearing the overall + per-section attempt gates at tester scale.
-        cp = _topic_questions("cp_acids_bases", "CP", 6, "ep_cp")
-        bb = _topic_questions("bb_enzymes", "BB", 5, "ep_bb")
-        kin = _topic_questions("cp_kinetics", "CP", 3, "ep_k")  # shipped, unattempted
-        store.upsert_questions(cp + bb + kin)
-        for q in cp:
+        store.upsert_questions(full_bank)
+        for q in full_bank:
             store.log_attempt(q["id"], correct=True)
-        for q in bb:
-            store.log_attempt(q["id"], correct=(q["id"].endswith(("0", "1", "2"))))
         read = mcat_scores.readiness_summary(col, store)
         cov = mcat_scores.coverage_summary(col, store)
 
-    assert read["status"] == "ok", read.get("reason")
-    lo, hi = read["range"]
-    assert lo is not None and hi is not None
-    assert 472 <= lo < hi <= 528
-    # Wide range at small n (honesty): well beyond the strict ±6 (width 12).
-    assert (hi - lo) > 12
-    # Mandatory honesty fields.
-    assert cov["pct"] >= mcat_scores.MIN_COVERAGE_PCT
-    assert read["coverage_pct"] == cov["pct"]
-    assert read.get("confidence_score") is not None
-    assert read.get("provisional") is True
-    assert read.get("note")  # missing-data / provisional caveat
-    assert read.get("next_action")  # single next action
+    assert cov["covered"] == mcat_scores.TOTAL_TOPICS
+    assert cov["total"] == mcat_scores.TOTAL_EXAM_TOPICS
+    assert cov["pct"] == round(100 * 18 / 49)
+    assert cov["pct"] < mcat_scores.MIN_COVERAGE_PCT
+    assert read["status"] == "abstain"
+    assert read["range"] is None
+    assert "exam outline coverage" in read["reason"]
 
 
 def test_empty_profile_still_abstains_under_tester_gates():
