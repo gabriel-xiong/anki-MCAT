@@ -1959,23 +1959,53 @@ class PerformanceView(QWidget):
         )
 
     def sync_ai_toggle_display(self) -> None:
-        """Reflect the persisted AI on/off state in the header control.
+        """Reflect the AI on/off state HONESTLY in the header control.
 
-        Called on build, on theme change, and whenever the Tools-menu toggle
-        flips the setting, so both entry points always agree.
+        The pill shows "AI: On" ONLY when the user toggle is on AND a live
+        backend (hosted proxy or direct provider) is actually configured — so it
+        never claims "On" while the panel is really serving the offline
+        source-based fallback. Three states:
+          * toggle off              -> "AI: Off"        (muted)
+          * on + backend configured -> "AI: On"         (accent)
+          * on + NOT configured     -> "AI: Not set up" (muted, honest)
+        The checkbox still mirrors the user's *preference*; only the label +
+        style reflect effective availability. Called on build, theme change, and
+        whenever either toggle entry point flips the setting.
         """
         if not hasattr(self, "ai_toggle_button"):
             return
-        from aqt.mcat.ai_bridge import ai_toggle_enabled
+        from aqt.mcat.ai_bridge import ai_provider_configured, ai_toggle_enabled
 
-        on = ai_toggle_enabled()
+        pref_on = ai_toggle_enabled()
+        # Cheap, network-free config-presence check (see ai_bridge). Guarded so a
+        # bridge hiccup can never break the header render.
+        try:
+            configured = ai_provider_configured()
+        except Exception:
+            configured = False
+        effective_on = pref_on and configured
+
         self.ai_toggle_button.blockSignals(True)
-        self.ai_toggle_button.setChecked(on)
+        self.ai_toggle_button.setChecked(pref_on)
         self.ai_toggle_button.blockSignals(False)
-        self.ai_toggle_button.setText("AI: On" if on else "AI: Off")
+        if not pref_on:
+            label = "AI: Off"
+        elif configured:
+            label = "AI: On"
+        else:
+            label = "AI: Not set up"
+        self.ai_toggle_button.setText(label)
         self.ai_toggle_button.setStyleSheet(
-            self._ai_toggle_style(_theme_tokens(), on)
+            self._ai_toggle_style(_theme_tokens(), effective_on)
         )
+        if hasattr(self, "assistant_sub_label"):
+            if effective_on:
+                sub = "Live AI help · grounded in the cited source"
+            elif pref_on:
+                sub = "AI not set up · offline source-based help"
+            else:
+                sub = "AI off · offline source-based help"
+            self.assistant_sub_label.setText(sub)
 
     def _on_toggle_ai_enabled(self) -> None:
         """Persist the runtime AI override and keep the Tools-menu action synced.
@@ -2100,15 +2130,17 @@ class PerformanceView(QWidget):
     def _explainer_status_note(tag: Optional[str]) -> str:
         """Honest one-line note shown above the static fallback explanation.
 
-        Distinguishes *not configured* (no provider/key) from a *configured but
-        failed* live call (missing SDK / timeout / transport-or-auth error), so
-        the student knows why they're seeing the source-based explanation and
-        whether retrying could help.
+        Distinguishes *not set up* (no proxy/provider configured) from a
+        *configured but failed* live call (missing SDK / timeout /
+        transport-or-auth error), so the student knows why they're seeing the
+        source-based explanation and whether retrying could help. The "not set
+        up" case is intentionally key-agnostic: the graded build reaches AI via
+        a hosted proxy (no per-user key), so it never tells a grader to add one.
         """
         if tag in ("off", "unavailable"):
             return (
-                "AI assistant not configured — add an API key to enable. "
-                "Showing the source-based explanation instead."
+                "AI assistant isn't set up on this build — showing the "
+                "source-based explanation instead."
             )
         if tag == "missing_sdk":
             return (
@@ -2226,8 +2258,9 @@ class PerformanceView(QWidget):
         """Human message for a follow-up that produced no answer, by reason."""
         if tag == "off":
             return (
-                "AI is off — set MCAT_LLM_PROVIDER and an API key in MCAT/.env "
-                "(see .env.example) to enable follow-ups."
+                "AI isn't set up on this build — the explanation above is the "
+                "offline, source-grounded fallback. Follow-ups need the AI "
+                "assistant configured."
             )
         if tag == "blocked":
             return (
