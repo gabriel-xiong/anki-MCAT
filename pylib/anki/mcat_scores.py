@@ -325,6 +325,50 @@ def _round_half_up(x: float) -> int:
     return int(math.floor(x + 0.5))
 
 
+# Default FSRS deck options for the Memory score — matches Anki's built-in
+# defaults (90% desired retention, FSRS-6 default weights). The Memory tile
+# needs collection-level FSRS ON + v3 scheduler so reviews populate per-card
+# ``memory_state`` (retrievability); desired retention affects scheduling only.
+FSRS_DESIRED_RETENTION = 0.9
+
+
+def ensure_fsrs_for_memory(col: Collection) -> bool:
+    """Enable FSRS + v3 scheduler and 90% desired retention on all deck configs.
+
+    Idempotent — safe to call from the seed tool and on every dashboard render
+    (fast no-op when already configured). Returns whether FSRS is enabled.
+    """
+    from anki.config import Config
+
+    changed = False
+    if col.sched_ver() != 2:
+        col.upgrade_to_v2_scheduler()
+        changed = True
+    if not col.get_config_bool(Config.Bool.SCHED_2021):
+        col.set_config_bool(Config.Bool.SCHED_2021, True)
+        changed = True
+    if not col.get_config("fsrs", False):
+        col.set_config("fsrs", True)
+        changed = True
+
+    for conf in col.decks.all_config():
+        preset_changed = False
+        if conf.get("desiredRetention") != FSRS_DESIRED_RETENTION:
+            conf["desiredRetention"] = FSRS_DESIRED_RETENTION
+            preset_changed = True
+        for key in ("fsrsParams6", "fsrsParams5", "fsrsWeights"):
+            if conf.get(key):
+                conf[key] = []
+                preset_changed = True
+        if preset_changed:
+            col.decks.update_config(conf)
+            changed = True
+
+    if changed:
+        col._load_scheduler()
+    return bool(col.get_config("fsrs", False))
+
+
 # ---------------------------------------------------------------------------
 # Memory — headline "Recall strength" 0-100 = retrievability × deck maturity.
 #
@@ -1087,6 +1131,9 @@ def dashboard_data(col: Collection, store: Optional[PerfStore] = None) -> dict[s
     if store is None:
         store = PerfStore(col)
     try:
+        # Belt-and-suspenders for non-preseeded paths (apkg import, old bases,
+        # dev profiles): Memory abstains without FSRS memory_state on review.
+        ensure_fsrs_for_memory(col)
         return {
             "memory": memory_summary(col),
             "performance": performance_summary(col, store),

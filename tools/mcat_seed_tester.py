@@ -117,30 +117,10 @@ def _seed_profile(base: Path) -> str:
 
 
 def _enable_fsrs(col) -> bool:
-    """Enable the v3 scheduler + FSRS so reviews populate per-card memory state.
+    """Enable FSRS + 90% retention on all deck presets (see ``ensure_fsrs_for_memory``)."""
+    from anki.mcat_scores import ensure_fsrs_for_memory
 
-    WHY (Memory score dependency): the Memory "Recall strength" reads FSRS
-    predicted retrievability, which only exists once a card carries an FSRS
-    ``memory_state`` — and that is computed on review ONLY when FSRS is enabled.
-    A freshly created collection defaults FSRS OFF (Rust ``BoolKey::Fsrs`` is
-    false by default) and may sit on the legacy scheduler, so a tester's reviews
-    would never yield a retrievability estimate and the Memory card could never
-    compute (even at the lowered friend-tester gates). Enabling both here is a
-    data/packaging change only — NO app source change. Default FSRS parameters
-    are used; memory state is computed per review going forward (testers start at
-    zero reviews, so every review they do is scored with FSRS on).
-    """
-    from anki.config import Config
-
-    if col.sched_ver() != 2:
-        col.upgrade_to_v2_scheduler()
-    # v3 scheduler (required for FSRS).
-    col.set_config_bool(Config.Bool.SCHED_2021, True)
-    # FSRS enable is keyed by the generic "fsrs" config (Rust BoolKey::Fsrs);
-    # there is no proto Config.Bool.FSRS member, so set the raw key.
-    col.set_config("fsrs", True)
-    col._load_scheduler()
-    return bool(col.get_config("fsrs", False))
+    return ensure_fsrs_for_memory(col)
 
 
 def _import_deck(col, data_dir: Path) -> int:
@@ -447,10 +427,9 @@ def main() -> None:
     col_path = _seed_profile(base)
     col = Collection(col_path)
     try:
-        # Enable FSRS (+ v3 scheduler) FIRST so the Memory score can compute:
-        # cards only gain an FSRS memory_state (-> retrievability) when reviewed
-        # with FSRS on. Without this the tester Memory card never populates.
-        fsrs_on = _enable_fsrs(col)
+        # Enable FSRS (+ v3 scheduler) before import so reviews populate
+        # memory_state; re-run after deck/options mutations as a safeguard.
+        _enable_fsrs(col)
         n_imported = _import_deck(col, data_dir)
         _rename_default_deck(col)
         # Scope the DECK to the shipped 3 topics BEFORE interleaving/limits.
@@ -459,6 +438,7 @@ def main() -> None:
         new_per_day = _set_new_cards_per_day(col, NEW_CARDS_PER_DAY)
         n_topic = len(col.find_cards("tag:topic:*"))
         n_q, n_r = _seed_sidecar(col, data_dir, SCOPE_TOPICS)
+        fsrs_on = _enable_fsrs(col)
         sidecar = mcat_perf.sidecar_path(col)
     finally:
         col.close()
@@ -474,7 +454,10 @@ def main() -> None:
     print(f"base dir     : {base}")
     print(f"collection   : {col_path}")
     print(f"sidecar      : {sidecar}  (exists={os.path.exists(sidecar)})")
-    print(f"fsrs enabled : {fsrs_on}  (required for Memory retrievability)")
+    print(
+        f"fsrs enabled : {fsrs_on}  (90% retention, default params; "
+        f"required for Memory retrievability)"
+    )
     print(f"scope topics : {', '.join(SCOPE_TOPICS)}")
     print(f"imported     : {n_imported} notes (all topics)")
     print(f"cards (kept) : {n_cards}  (scoped to {len(SCOPE_TOPICS)} topics)")
