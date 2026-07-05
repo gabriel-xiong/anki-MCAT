@@ -58,6 +58,54 @@ def _cp_questions(n: int, prefix: str) -> list[dict]:
     ]
 
 
+def _memory_card(dashboard_html: str) -> str:
+    """The Memory card slice (from its label up to the Accuracy label)."""
+    start = dashboard_html.index(">Memory</span>")
+    end = dashboard_html.index(">Accuracy</span>", start)
+    return dashboard_html[start:end]
+
+
+def test_memory_card_subline_shows_review_progress_when_below_gate():
+    col = _tmp_col()
+    try:
+        with PerfStore(col) as store:
+            data = mcat_scores.dashboard_data(col, store)
+        out = _mcat_dashboard_html(data)
+    finally:
+        col.close()
+
+    mem = _memory_card(out)
+    assert "No score yet" in mem
+    assert "not enough data" in mem
+    need = mcat_scores.MIN_MEMORY_REVIEWS
+    assert f"Need {need} more reviews" in mem
+    assert f"have 0/{need}" in mem
+
+
+def test_memory_card_subline_names_fsrs_when_disabled():
+    col = _tmp_col()
+    try:
+        n = mcat_scores.MIN_STARTED_CARDS_FOR_MEMORY + 2
+        for i in range(n):
+            note = col.newNote()
+            note["Front"] = f"card {i}"
+            col.addNote(note)
+        for _ in range(n):
+            c = col.sched.getCard()
+            assert c is not None
+            col.sched.answerCard(c, 3)
+        with PerfStore(col) as store:
+            data = mcat_scores.dashboard_data(col, store)
+        out = _mcat_dashboard_html(data)
+    finally:
+        col.close()
+
+    mem = _memory_card(out)
+    assert "No score yet" in mem
+    assert "Enable FSRS" in mem
+    assert f"0/{n}" in mem
+
+
 def test_accuracy_card_abstains_with_no_number_under_gate():
     col = _tmp_col()
     try:
