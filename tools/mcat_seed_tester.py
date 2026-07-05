@@ -278,6 +278,60 @@ def _bundle_docs(dist: Path, mcat_root: Path) -> None:
     shutil.copy2(src, dist / "TESTER-QUICKSTART.md")
 
 
+def _bundle_ai_proxy(dist: Path, mcat_root: Path) -> list[str]:
+    """Ship the keyless-AI-proxy client bits into the distribution (data only).
+
+    Copies the MINIMAL runtime scripts the compiled AI bridge delegates to
+    (``ai_explain``/``ai_qa``/``mcat_env``) under ``mcat-ai/scripts/`` so the app
+    can resolve them via ``MCAT_ROOT`` (set by the launcher), drops a PLACEHOLDER
+    ``mcat-ai-proxy.json`` next to the launcher for the human to fill in after
+    deploy, and includes the setup doc. NO URL/token/key is baked in — the
+    shipped config is inert (placeholder URL => proxy OFF => source-based
+    fallback) until the human pastes real values. Returns a short manifest.
+
+    This is additive + dormant: with the placeholder config the app behaves
+    exactly like the friend build (offline, source-grounded). It only lights up
+    live AI once a real proxy URL + token are pasted in — no rebuild needed.
+    """
+    manifest: list[str] = []
+    ai_scripts = dist / "mcat-ai" / "scripts"
+    ai_scripts.mkdir(parents=True, exist_ok=True)
+    for fname in ("ai_explain.py", "ai_qa.py", "mcat_env.py"):
+        src = mcat_root / "scripts" / fname
+        if not src.exists():
+            raise SystemExit(f"missing AI script to bundle: {src}")
+        shutil.copy2(src, ai_scripts / fname)
+        manifest.append(f"mcat-ai/scripts/{fname}")
+
+    cfg_dst = dist / "mcat-ai-proxy.json"
+    cfg_src = mcat_root / "proxy" / "mcat-ai-proxy.example.json"
+    if cfg_src.exists():
+        shutil.copy2(cfg_src, cfg_dst)
+    else:  # self-contained fallback template (still a placeholder, no secrets)
+        cfg_dst.write_text(
+            json.dumps(
+                {
+                    "_comment": (
+                        "Paste your deployed proxy URL + bundle token. NO API "
+                        "key here. See AI-PROXY-SETUP.md."
+                    ),
+                    "proxy_url": "REPLACE_WITH_YOUR_PROXY_URL",
+                    "bundle_token": "REPLACE_WITH_YOUR_BUNDLE_TOKEN",
+                    "model": "gpt-4o-mini",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    manifest.append("mcat-ai-proxy.json (placeholder)")
+
+    setup_doc = mcat_root / "docs" / "AI-PROXY-SETUP.md"
+    if setup_doc.exists():
+        shutil.copy2(setup_doc, dist / "AI-PROXY-SETUP.md")
+        manifest.append("AI-PROXY-SETUP.md")
+    return manifest
+
+
 def _build_zip(dist: Path) -> Path:
     """Zip MCAT-Speedrun/ for shipping alongside the MSI."""
     zip_base = dist / "MCAT-Speedrun"
@@ -288,15 +342,30 @@ def _build_zip(dist: Path) -> Path:
     return zip_path
 
 
-def _write_launcher(dist: Path, base_rel: str) -> None:
-    """Emit the double-click Windows launcher + a plain-text READ ME."""
+def _write_launcher(dist: Path, base_rel: str, ai_proxy: bool = False) -> None:
+    """Emit the double-click Windows launcher + a plain-text READ ME.
+
+    When ``ai_proxy`` is set, the launcher ALSO exports two env vars that the
+    already-compiled app reads at startup: ``MCAT_ROOT`` (points at the bundled
+    ``mcat-ai`` scripts so the AI bridge resolves) and ``MCAT_AI_PROXY_CONFIG``
+    (points at the editable ``mcat-ai-proxy.json`` next to this launcher). This
+    is what makes the proxy URL/token CONFIG-DRIVEN — no MSI rebuild to set or
+    change them; ``set`` before ``start`` so the launched Anki inherits them.
+    """
+    ai_env = ""
+    if ai_proxy:
+        ai_env = (
+            'set "MCAT_ROOT=%~dp0mcat-ai"\r\n'
+            'set "MCAT_AI_PROXY_CONFIG=%~dp0mcat-ai-proxy.json"\r\n'
+        )
     launcher = dist / "Start MCAT Speedrun.cmd"
     launcher.write_text(
         "@echo off\r\n"
         "REM Turnkey launcher: opens Anki on the preseeded MCAT base folder.\r\n"
         "setlocal\r\n"
         f'set "BASE=%~dp0{base_rel}"\r\n'
-        'set "ANKI="\r\n'
+        + ai_env
+        + 'set "ANKI="\r\n'
         'if exist "%PROGRAMFILES%\\Anki\\Anki.exe" '
         'set "ANKI=%PROGRAMFILES%\\Anki\\Anki.exe"\r\n'
         'if not defined ANKI if exist "%LOCALAPPDATA%\\Programs\\Anki\\Anki.exe" '
@@ -349,6 +418,14 @@ def main() -> None:
         action="store_true",
         help="do not wipe an existing --out dir first",
     )
+    ap.add_argument(
+        "--with-ai-proxy",
+        action="store_true",
+        help="also ship the keyless AI-proxy client bits (mcat-ai/ scripts + a "
+        "PLACEHOLDER mcat-ai-proxy.json + setup doc) and point the launcher at "
+        "them. Dormant until the human pastes a real proxy URL+token; no secret "
+        "is baked in. Use for the GRADED build.",
+    )
     args = ap.parse_args()
 
     mcat_root = Path(args.mcat).expanduser().resolve() if args.mcat else _default_mcat_root()
@@ -386,8 +463,11 @@ def main() -> None:
     finally:
         col.close()
 
-    _write_launcher(dist / "MCAT-Speedrun", "mcat-base")
+    _write_launcher(dist / "MCAT-Speedrun", "mcat-base", ai_proxy=args.with_ai_proxy)
     _bundle_docs(dist / "MCAT-Speedrun", mcat_root)
+    ai_manifest: list[str] = []
+    if args.with_ai_proxy:
+        ai_manifest = _bundle_ai_proxy(dist / "MCAT-Speedrun", mcat_root)
     zip_path = _build_zip(dist)
 
     print("=== MCAT tester base seeded ===")
@@ -404,6 +484,11 @@ def main() -> None:
     print(f"remediation  : {n_r}")
     print(f"distribution : {dist / 'MCAT-Speedrun'}")
     print(f"zip          : {zip_path}")
+    if args.with_ai_proxy:
+        print(f"ai-proxy     : shipped -> {', '.join(ai_manifest)}")
+        print("               (placeholder config; live AI OFF until URL+token pasted)")
+    else:
+        print("ai-proxy     : not shipped (friend build; AI off, source-based)")
     print("\nNext: install the MSI, then double-click 'Start MCAT Speedrun.cmd'.")
 
 
