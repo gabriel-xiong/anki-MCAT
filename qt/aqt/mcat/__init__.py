@@ -88,6 +88,48 @@ def setup_mcat_menu(mw: AnkiQt) -> None:
     setup_ai_toggle_action(mw, menu)
 
 
+def apply_ai_toggle(
+    mw: AnkiQt,
+    enabled: bool,
+    *,
+    show_tooltip: bool = True,
+    parent: QWidget | None = None,
+) -> None:
+    """Persist the AI toggle and sync Tools menu, performance pill, dashboard."""
+    from aqt.mcat.ai_bridge import set_ai_toggle_enabled
+
+    set_ai_toggle_enabled(enabled)
+    act = getattr(mw, "_mcatAiToggleAction", None)
+    if act is not None:
+        try:
+            act.setChecked(enabled)
+        except Exception:
+            pass
+    view = getattr(mw, "mcatPerformanceView", None)
+    if view is not None and hasattr(view, "sync_ai_toggle_display"):
+        try:
+            view.sync_ai_toggle_display()
+        except Exception:
+            pass
+    if mw.state == "deckBrowser":
+        mw.deckBrowser.refresh()
+    if show_tooltip:
+        tooltip(
+            "AI assistant enabled."
+            if enabled
+            else "AI assistant off — explanations use the offline, "
+            "source-grounded fallback.",
+            parent=parent or mw,
+        )
+
+
+def toggle_ai_enabled(mw: AnkiQt) -> None:
+    """Flip the runtime AI toggle from the dashboard pill (or other entry)."""
+    from aqt.mcat.ai_bridge import ai_toggle_enabled
+
+    apply_ai_toggle(mw, not ai_toggle_enabled())
+
+
 def setup_ai_toggle_action(mw: AnkiQt, menu: QMenu) -> None:
     """Add the runtime AI on/off toggle to the Tools menu.
 
@@ -98,7 +140,7 @@ def setup_ai_toggle_action(mw: AnkiQt, menu: QMenu) -> None:
     even when a provider + key are configured. The env gate is unchanged; this
     is an additional force-off override on top of it.
     """
-    from aqt.mcat.ai_bridge import ai_toggle_enabled, set_ai_toggle_enabled
+    from aqt.mcat.ai_bridge import ai_toggle_enabled
 
     menu.addSeparator()
     act_ai = QAction("MCAT: AI assistant enabled", mw)
@@ -106,21 +148,7 @@ def setup_ai_toggle_action(mw: AnkiQt, menu: QMenu) -> None:
     act_ai.setChecked(ai_toggle_enabled())
 
     def on_toggle(checked: bool) -> None:
-        set_ai_toggle_enabled(checked)
-        # Reflect the change in an OPEN performance panel's header control.
-        view = getattr(mw, "mcatPerformanceView", None)
-        if view is not None and hasattr(view, "sync_ai_toggle_display"):
-            try:
-                view.sync_ai_toggle_display()
-            except Exception:
-                pass
-        tooltip(
-            "AI assistant enabled."
-            if checked
-            else "AI assistant off — explanations use the offline, "
-            "source-grounded fallback.",
-            parent=mw,
-        )
+        apply_ai_toggle(mw, checked)
 
     qconnect(act_ai.triggered, on_toggle)
     menu.addAction(act_ai)

@@ -168,6 +168,10 @@ class DeckBrowser:
             from aqt.mcat import export_my_data
 
             export_my_data(self.mw)
+        elif cmd == "mcat_ai_toggle":
+            from aqt.mcat import toggle_ai_enabled
+
+            toggle_ai_enabled(self.mw)
         return False
 
     def set_current_deck(self, deck_id: DeckId) -> None:
@@ -721,6 +725,25 @@ def _mcat_focus_html(focus: dict[str, Any] | None) -> str:
 </div>"""
 
 
+def _mcat_ai_toggle_html() -> str:
+    """Prominent dashboard pill — same honest states as the performance header."""
+    from aqt.mcat.ai_bridge import ai_toggle_display_state
+
+    st = ai_toggle_display_state()
+    css_class = (
+        "mcat-ai-toggle-on" if st["effective_on"] else "mcat-ai-toggle-off"
+    )
+    tip = (
+        "Turn the AI assistant on or off. When off, explanations use the "
+        "offline, source-grounded fallback."
+    )
+    return (
+        f'<button type="button" class="mcat-ai-toggle {css_class}" '
+        f'onclick=\'pycmd("mcat_ai_toggle")\' '
+        f'title="{html.escape(tip)}">{html.escape(str(st["label"]))}</button>'
+    )
+
+
 def _mcat_dashboard_html(data: dict[str, Any]) -> str:
     from anki import mcat_scores
 
@@ -884,6 +907,7 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
     )
 
     cov_pct = cov["pct"]
+    ai_toggle_html = _mcat_ai_toggle_html()
     return f"""
 <style>
 .mcat-dash {{
@@ -891,11 +915,33 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
   text-align: start; font-size: 14px;
 }}
 .mcat-dash-head {{
-  display: flex; align-items: baseline; justify-content: space-between;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
   margin-bottom: 7px;
+}}
+.mcat-dash-head-left {{
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  min-width: 0;
 }}
 .mcat-dash-title {{ font-size: 15px; font-weight: 700; }}
 .mcat-dash-sub {{ color: var(--fg-subtle, #888); font-size: 11px; }}
+.mcat-ai-toggle {{
+  font: inherit; font-size: 11px; font-weight: 700; line-height: 1.2;
+  padding: 4px 12px; border-radius: 999px; cursor: pointer;
+  background: transparent; flex-shrink: 0;
+}}
+.mcat-ai-toggle-on {{
+  color: #4c7cf3; border: 1.5px solid #4c7cf3;
+}}
+.mcat-ai-toggle-on:hover {{
+  background: rgba(76,124,243,0.08);
+}}
+.mcat-ai-toggle-off {{
+  color: var(--fg-subtle, #888); border: 1.5px solid var(--border, #e4e4e7);
+}}
+.mcat-ai-toggle-off:hover {{
+  color: #4c7cf3; border-color: #4c7cf3;
+}}
 .mcat-cards {{ display: flex; gap: 12px; flex-wrap: wrap; }}
 .mcat-card {{
   flex: 1 1 0; min-width: 200px; border: 1px solid var(--border, #e4e4e7);
@@ -990,8 +1036,11 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
 </style>
 <div class="mcat-dash">
   <div class="mcat-dash-head">
-    <span class="mcat-dash-title">MCAT Speedrun</span>
-    <span class="mcat-dash-sub">three separate scores · never blended</span>
+    <div class="mcat-dash-head-left">
+      <span class="mcat-dash-title">MCAT Speedrun</span>
+      <span class="mcat-dash-sub">three separate scores · never blended</span>
+    </div>
+    {ai_toggle_html}
   </div>
   <div class="mcat-cards">
     {mem_card}

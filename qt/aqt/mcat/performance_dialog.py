@@ -1959,42 +1959,19 @@ class PerformanceView(QWidget):
         )
 
     def sync_ai_toggle_display(self) -> None:
-        """Reflect the AI on/off state HONESTLY in the header control.
-
-        The pill shows "AI: On" ONLY when the user toggle is on AND a live
-        backend (hosted proxy or direct provider) is actually configured — so it
-        never claims "On" while the panel is really serving the offline
-        source-based fallback. Three states:
-          * toggle off              -> "AI: Off"        (muted)
-          * on + backend configured -> "AI: On"         (accent)
-          * on + NOT configured     -> "AI: Not set up" (muted, honest)
-        The checkbox still mirrors the user's *preference*; only the label +
-        style reflect effective availability. Called on build, theme change, and
-        whenever either toggle entry point flips the setting.
-        """
+        """Reflect the AI on/off state HONESTLY in the header control."""
         if not hasattr(self, "ai_toggle_button"):
             return
-        from aqt.mcat.ai_bridge import ai_provider_configured, ai_toggle_enabled
+        from aqt.mcat.ai_bridge import ai_toggle_display_state
 
-        pref_on = ai_toggle_enabled()
-        # Cheap, network-free config-presence check (see ai_bridge). Guarded so a
-        # bridge hiccup can never break the header render.
-        try:
-            configured = ai_provider_configured()
-        except Exception:
-            configured = False
-        effective_on = pref_on and configured
+        st = ai_toggle_display_state()
+        pref_on = bool(st["pref_on"])
+        effective_on = bool(st["effective_on"])
 
         self.ai_toggle_button.blockSignals(True)
         self.ai_toggle_button.setChecked(pref_on)
         self.ai_toggle_button.blockSignals(False)
-        if not pref_on:
-            label = "AI: Off"
-        elif configured:
-            label = "AI: On"
-        else:
-            label = "AI: Not set up"
-        self.ai_toggle_button.setText(label)
+        self.ai_toggle_button.setText(str(st["label"]))
         self.ai_toggle_button.setStyleSheet(
             self._ai_toggle_style(_theme_tokens(), effective_on)
         )
@@ -2008,30 +1985,10 @@ class PerformanceView(QWidget):
             self.assistant_sub_label.setText(sub)
 
     def _on_toggle_ai_enabled(self) -> None:
-        """Persist the runtime AI override and keep the Tools-menu action synced.
+        """Persist the runtime AI override and keep all entry points synced."""
+        from aqt.mcat import apply_ai_toggle
 
-        Takes effect immediately: the next Ask/follow-up consults the toggle at
-        the ai_bridge choke point, so OFF serves the static fallback with no
-        restart. Does not tear down any answer already on screen.
-        """
-        from aqt.mcat.ai_bridge import set_ai_toggle_enabled
-
-        enabled = self.ai_toggle_button.isChecked()
-        set_ai_toggle_enabled(enabled)
-        self.sync_ai_toggle_display()
-        act = getattr(self.mw, "_mcatAiToggleAction", None)
-        if act is not None:
-            try:
-                act.setChecked(enabled)
-            except Exception:
-                pass
-        tooltip(
-            "AI assistant on."
-            if enabled
-            else "AI assistant off — using offline, source-grounded "
-            "explanations.",
-            parent=self,
-        )
+        apply_ai_toggle(self.mw, self.ai_toggle_button.isChecked(), parent=self)
 
     def _on_ask_ai(self) -> None:
         """Opt-in: fetch per-choice AI explainer (live LLM when configured).
