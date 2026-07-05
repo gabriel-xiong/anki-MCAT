@@ -118,6 +118,14 @@ def _failure_tag(exc: BaseException | str) -> str:
         return "missing_sdk"
     if "timeout" in name or "timed out" in text or "timeout" in text:
         return "timeout"
+    # Blank/malformed proxy URL must read as "not set up", not a transport retry.
+    if (
+        "proxy url not configured" in text
+        or "unknown url type: ''" in text
+        or "error sending request for url ()" in text
+        or "missing an 'http://' or 'https://' protocol" in text
+    ):
+        return "off"
     return "error"
 
 
