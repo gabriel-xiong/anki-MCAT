@@ -618,12 +618,10 @@ def shipped_scope_sections(store: PerfStore) -> set[str]:
 # ---------------------------------------------------------------------------
 # Coverage
 # ---------------------------------------------------------------------------
-def coverage_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
-    """Fraction of the SHIPPED-scope topics with measurement (cards seen or
-    scored attempts). The denominator is the topics this build ships questions
-    for (see ``shipped_scope_topics``), so a 3-topic tester is measured against
-    3 — unlocking 2 of 3 is 66% (≥ the 50% Readiness gate)."""
-    scope = shipped_scope_topics(store)
+def _measured_topics_in_scope(
+    col: Collection, store: PerfStore, scope: set[str]
+) -> set[str]:
+    """Outline/shipped topics with measurement: cards seen or scored perf attempt."""
     measured: set[str] = set()
     for m in col.get_topic_mastery():
         if m.cards_seen > 0 and m.topic_id in scope:
@@ -638,14 +636,48 @@ def coverage_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
     ):
         if row["topic_id"] in scope:
             measured.add(row["topic_id"])
+    return measured
 
-    total = len(scope)
-    pct = round(100 * len(measured) / total) if total else 0
+
+def coverage_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
+    """Dual coverage metrics for honest dashboard display (PRD §6.5, DECISIONS §2).
+
+    * **Outline** — measured topics / full v1 outline (18). Drives the coverage
+      bar and the Readiness abstain gate (≥50% outline coverage).
+    * **Shipped** — measured topics / topics this build ships questions for.
+      Secondary label so a 3-topic tester bank can show 2/3 without implying
+      full-course coverage.
+
+    "Measured" = topic has ``cards_seen > 0`` OR a scored performance attempt
+    (``idk = 0``), same rule applied within each denominator scope."""
+    shipped_scope = shipped_scope_topics(store)
+    outline_scope = OUTLINE_TOPIC_IDS
+    shipped_measured = _measured_topics_in_scope(col, store, shipped_scope)
+    outline_measured = _measured_topics_in_scope(col, store, outline_scope)
+
+    shipped_total = len(shipped_scope)
+    outline_total = TOTAL_TOPICS
+    shipped_pct = (
+        round(100 * len(shipped_measured) / shipped_total) if shipped_total else 0
+    )
+    outline_pct = (
+        round(100 * len(outline_measured) / outline_total) if outline_total else 0
+    )
     return {
-        "measured": len(measured),
-        "total": total,
-        "pct": pct,
-        "measured_topics": sorted(measured),
+        # Primary (spec): full outline denominator — readiness + coverage bar.
+        "outline_measured": len(outline_measured),
+        "outline_total": outline_total,
+        "outline_pct": outline_pct,
+        # Secondary: shipped content scope (friend-tester bank progress).
+        "shipped_measured": len(shipped_measured),
+        "shipped_total": shipped_total,
+        "shipped_pct": shipped_pct,
+        # Backward-compatible aliases for outline (primary honesty metric).
+        "measured": len(outline_measured),
+        "total": outline_total,
+        "pct": outline_pct,
+        "measured_topics": sorted(outline_measured),
+        "shipped_measured_topics": sorted(shipped_measured),
     }
 
 
@@ -723,8 +755,11 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
         reasons.append(f"reviews < {MIN_MEMORY_REVIEWS}")
     if perf["attempts"] < MIN_PERF_ATTEMPTS:
         reasons.append(f"attempts < {MIN_PERF_ATTEMPTS}")
-    if cov["pct"] < MIN_COVERAGE_PCT:
-        reasons.append(f"coverage < {MIN_COVERAGE_PCT}%")
+    outline_cov_pct = cov["outline_pct"]
+    if outline_cov_pct < MIN_COVERAGE_PCT:
+        reasons.append(
+            f"outline coverage {outline_cov_pct}% < {MIN_COVERAGE_PCT}%"
+        )
     for sec in SCIENCE_SECTIONS:
         if (
             sec in shipped_sections
@@ -740,7 +775,7 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
     if reasons:
         return {
             "status": "abstain",
-            "coverage_pct": cov["pct"],
+            "coverage_pct": outline_cov_pct,
             "reason": "; ".join(reasons),
             "range": None,
         }
@@ -753,11 +788,11 @@ def readiness_summary(col: Collection, store: PerfStore) -> dict[str, Any]:
     # blend of the other two scores.
     low, high = _provisional_range(store, perf["attempts"])
     confidence_score = _readiness_confidence(
-        cov["pct"] / 100.0, perf["attempts"], high - low
+        outline_cov_pct / 100.0, perf["attempts"], high - low
     )
     return {
         "status": "ok",
-        "coverage_pct": cov["pct"],
+        "coverage_pct": outline_cov_pct,
         "reason": None,
         "range": [low, high],
         # numeric 0-100 confidence (headline detail). Bucket label kept as a

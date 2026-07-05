@@ -885,7 +885,8 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
         # read like the blocker (the real blockers live in the gate note below).
         blockers = str(read["reason"] or "").split("; ")
         read_sub = (
-            f"Need {mcat_scores.MIN_COVERAGE_PCT}% coverage"
+            f"Need {mcat_scores.MIN_COVERAGE_PCT}% outline coverage "
+            f"(have {cov_pct_r}%)"
             if cov_pct_r < mcat_scores.MIN_COVERAGE_PCT
             else (blockers[0].replace("<", "under") if blockers else "Need more data")
         )
@@ -906,7 +907,17 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
         provisional=read_provisional,
     )
 
-    cov_pct = cov["pct"]
+    cov_pct = cov["outline_pct"]
+    shipped_label = (
+        f"Shipped content: {cov['shipped_pct']}% "
+        f"({cov['shipped_measured']}/{cov['shipped_total']})"
+        if cov["shipped_total"]
+        else "Shipped content: no question bank loaded"
+    )
+    outline_label = (
+        f"Outline coverage: {cov['outline_pct']}% "
+        f"({cov['outline_measured']}/{cov['outline_total']} topics)"
+    )
     ai_toggle_html = _mcat_ai_toggle_html()
     return f"""
 <style>
@@ -1001,6 +1012,8 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
   width: {cov_pct}%; box-shadow: 0 1px 2px rgba(43,182,115,0.35); }}
 .mcat-cover-label {{ font-size: 12.5px; font-weight: 600;
   color: var(--fg-subtle, #888); }}
+.mcat-cover-label-secondary {{ display: block; font-size: 11.5px; font-weight: 500;
+  margin-top: 2px; opacity: .85; }}
 .mcat-focus {{ margin-top: 12px; display: flex; align-items: center;
   justify-content: space-between; gap: 14px; flex-wrap: wrap;
   border: 1px solid var(--border, #e4e4e7); border-left: 4px solid #f5a623;
@@ -1049,7 +1062,8 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
   </div>
   {focus_html}
   <div class="mcat-cover-wrap">
-    <span class="mcat-cover-label">Coverage: {cov['measured']}/{cov['total']} topics measured ({cov_pct}%)</span>
+    <span class="mcat-cover-label">{outline_label}</span>
+    <span class="mcat-cover-label mcat-cover-label-secondary">{shipped_label}</span>
     <div class="mcat-cover-bar"><div class="mcat-cover-fill"></div></div>
   </div>
   <div class="mcat-secondary-row">
