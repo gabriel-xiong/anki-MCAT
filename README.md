@@ -43,6 +43,9 @@ question bank is curated offline from named sources.
 See the companion repo's `docs/` (PRD, ARCHITECTURE, DECISIONS,
 MASTERY-QUERY-SPEC, PERFORMANCE-MODE-SPEC) for full specs and the decision log.
 
+**Graded MSI handoff (install, launcher, proxy JSON, strict profile):**
+[`docs/GRADED-HANDOFF.md`](./docs/GRADED-HANDOFF.md).
+
 ## Building & running from source
 
 Anki builds with its standard toolchain (Rust + a bundled Python env driven by
