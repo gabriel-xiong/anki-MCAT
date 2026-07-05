@@ -136,17 +136,15 @@ def _load_bridge() -> dict[str, Any] | None:
         return None
 
 
-def ai_available() -> bool:
-    """True when a live LLM provider is configured (still requires opt-in).
+def ai_provider_configured() -> bool:
+    """True when a live AI backend is configured, IGNORING the user toggle.
 
-    Never raises: a provider that is named but unusable (missing API key, or a
-    misconfigured provider value) is reported as *not available* so the caller
-    degrades to the AI-off path instead of crashing the GUI thread.
+    A "backend" is either a hosted **proxy** (keyless — ``mcat-ai-proxy.json`` /
+    ``MCAT_AI_PROXY_URL``) or a direct provider + key (``MCAT_LLM_PROVIDER``).
+    This is a cheap, network-free CONFIG-PRESENCE check (the SDKs / network are
+    only touched when a call actually runs), so the UI can honestly show whether
+    AI is set up on this build without pinging anything. Never raises.
     """
-    # Runtime override: an OFF toggle force-disables live AI regardless of env,
-    # so the caller degrades to the static path exactly as AI-off does today.
-    if not ai_toggle_enabled():
-        return False
     bridge = _load_bridge()
     if not bridge:
         return False
@@ -157,6 +155,20 @@ def ai_available() -> bool:
         # e.g. ProviderUnavailable (no key) or ValueError (unknown provider).
         return False
     return caller is not None
+
+
+def ai_available() -> bool:
+    """True when live AI is BOTH configured and enabled by the user toggle.
+
+    Never raises: a backend that is named but unusable (missing key / bad
+    provider value / no proxy URL) is reported as *not available* so the caller
+    degrades to the AI-off path instead of crashing the GUI thread.
+    """
+    # Runtime override: an OFF toggle force-disables live AI regardless of env,
+    # so the caller degrades to the static path exactly as AI-off does today.
+    if not ai_toggle_enabled():
+        return False
+    return ai_provider_configured()
 
 
 def _format_explanation_body(expl: Any) -> str:
