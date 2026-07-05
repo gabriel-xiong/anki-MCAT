@@ -35,6 +35,20 @@ def _read_default_lang(base: Path) -> str | None:
         con.close()
 
 
+def _read_profile_auto_sync(base: Path, profile_name: str = "User 1") -> bool:
+    db = base / "prefs21.db"
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute(
+            "select data from profiles where name=? collate nocase",
+            (profile_name,),
+        ).fetchone()
+        prof = pickle.loads(row[0])
+        return bool(prof.get("autoSync", True))
+    finally:
+        con.close()
+
+
 def test_missing_default_lang_fallback_does_not_crash():
     """Mirror setupLangAndBackend guard when defaultLang is None."""
     import anki.lang
@@ -76,6 +90,7 @@ def test_seed_tool_sets_default_lang(tmp_path):
 
     base = tmp_path / "MCAT-Speedrun" / "mcat-base"
     assert _read_default_lang(base) == "en_US"
+    assert _read_profile_auto_sync(base) is False
     assert (tmp_path / "MCAT-Speedrun" / "TESTER-QUICKSTART.md").exists()
     assert (tmp_path / "MCAT-Speedrun.zip").exists()
 

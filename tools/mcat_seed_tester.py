@@ -116,6 +116,23 @@ def _seed_profile(base: Path) -> str:
     return str(prof_dir / "collection.anki2")
 
 
+def _disable_auto_sync_on_open(base: Path, profile_name: str = PROFILE_NAME) -> bool:
+    """Turn off Preferences → Sync → auto-sync on open/close for a seeded base.
+
+    Stored in ``prefs21.db`` profile pickle as ``autoSync`` (see
+    ``ProfileManager.auto_syncing_enabled``). Does NOT clear ``syncKey`` /
+    AnkiWeb login — graders can still sync manually via the Sync button.
+    """
+    from aqt.profiles import ProfileManager
+
+    pm = ProfileManager(base)
+    pm.setupMeta()
+    pm.load(profile_name)
+    pm.profile["autoSync"] = False
+    pm.save()
+    return not pm.auto_syncing_enabled()
+
+
 def _enable_fsrs(col) -> bool:
     """Enable FSRS + 90% retention on all deck presets (see ``ensure_fsrs_for_memory``)."""
     from anki.mcat_scores import ensure_fsrs_for_memory
@@ -443,6 +460,8 @@ def main() -> None:
     finally:
         col.close()
 
+    auto_sync_off = _disable_auto_sync_on_open(base)
+
     _write_launcher(dist / "MCAT-Speedrun", "mcat-base", ai_proxy=args.with_ai_proxy)
     _bundle_docs(dist / "MCAT-Speedrun", mcat_root)
     ai_manifest: list[str] = []
@@ -457,6 +476,10 @@ def main() -> None:
     print(
         f"fsrs enabled : {fsrs_on}  (90% retention, default params; "
         f"required for Memory retrievability)"
+    )
+    print(
+        f"auto-sync    : {'off' if auto_sync_off else 'ON (unexpected)'}  "
+        f"(prefs autoSync=False; manual Sync still works)"
     )
     print(f"scope topics : {', '.join(SCOPE_TOPICS)}")
     print(f"imported     : {n_imported} notes (all topics)")
