@@ -137,6 +137,7 @@ def _enable_fsrs(col) -> bool:
     """Enable FSRS + 90% retention on all deck presets (see ``ensure_fsrs_for_memory``)."""
     from anki.mcat_scores import ensure_fsrs_for_memory
 
+
     return ensure_fsrs_for_memory(col)
 
 
@@ -481,6 +482,7 @@ def main() -> None:
         f"auto-sync    : {'off' if auto_sync_off else 'ON (unexpected)'}  "
         f"(prefs autoSync=False; manual Sync still works)"
     )
+
     print(f"scope topics : {', '.join(SCOPE_TOPICS)}")
     print(f"imported     : {n_imported} notes (all topics)")
     print(f"cards (kept) : {n_cards}  (scoped to {len(SCOPE_TOPICS)} topics)")
