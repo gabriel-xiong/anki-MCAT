@@ -885,7 +885,7 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
         # read like the blocker (the real blockers live in the gate note below).
         blockers = str(read["reason"] or "").split("; ")
         read_sub = (
-            f"Need {mcat_scores.MIN_COVERAGE_PCT}% outline coverage "
+            f"Need {mcat_scores.MIN_COVERAGE_PCT}% exam outline coverage "
             f"(have {cov_pct_r}%)"
             if cov_pct_r < mcat_scores.MIN_COVERAGE_PCT
             else (blockers[0].replace("<", "under") if blockers else "Need more data")
@@ -907,16 +907,10 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
         provisional=read_provisional,
     )
 
-    cov_pct = cov["outline_pct"]
-    shipped_label = (
-        f"Shipped content: {cov['shipped_pct']}% "
-        f"({cov['shipped_measured']}/{cov['shipped_total']})"
-        if cov["shipped_total"]
-        else "Shipped content: no question bank loaded"
-    )
+    cov_pct = cov["pct"]
     outline_label = (
-        f"Outline coverage: {cov['outline_pct']}% "
-        f"({cov['outline_measured']}/{cov['outline_total']} topics)"
+        f"Exam outline coverage: {cov['pct']}% "
+        f"({cov['covered']}/{cov['total']} topics in deck)"
     )
     ai_toggle_html = _mcat_ai_toggle_html()
     return f"""
@@ -1063,7 +1057,6 @@ def _mcat_dashboard_html(data: dict[str, Any]) -> str:
   {focus_html}
   <div class="mcat-cover-wrap">
     <span class="mcat-cover-label">{outline_label}</span>
-    <span class="mcat-cover-label mcat-cover-label-secondary">{shipped_label}</span>
     <div class="mcat-cover-bar"><div class="mcat-cover-fill"></div></div>
   </div>
   <div class="mcat-secondary-row">
