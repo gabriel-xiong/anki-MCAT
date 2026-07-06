@@ -25,7 +25,7 @@ class CustomBuildHook(BuildHookInterface):
         project_root = Path(self.root).parent
         generated_root = project_root / "out" / "qt" / "_aqt"
 
-        if not os.environ.get("ANKI_WHEEL_TAG"):
+        if not (os.environ.get("ANKI_WHEEL_TAG") or "").strip():
             # On Windows, uv invokes this build hook during the initial uv sync,
             # when the tag has not been declared by our build script.
             return

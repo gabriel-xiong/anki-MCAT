@@ -127,7 +127,13 @@ pub struct BuildWheel {
 
 impl BuildAction for BuildWheel {
     fn command(&self) -> &str {
-        "$uv build --wheel --out-dir=$out_dir --project=$project_dir"
+        if cfg!(windows) {
+            // uv's PEP 517 driver crashes hatchling (exit 0xffffffff) when our build
+            // hook sets ANKI_WHEEL_TAG on Windows; invoke hatchling directly instead.
+            "$runner run --cwd=$project_dir $pyenv_bin -m hatchling build --target wheel -d $wheel_out_dir"
+        } else {
+            "$uv build --wheel --out-dir=$out_dir --project=$project_dir"
+        }
     }
 
     fn files(&mut self, build: &mut impl FilesHandle) {
@@ -139,6 +145,7 @@ impl BuildAction for BuildWheel {
             build.add_inputs("uv", inputs![":uv_binary"]);
         }
 
+        build.add_inputs("pyenv_bin", inputs![":pyenv:bin"]);
         build.add_inputs("", &self.deps);
 
         build.add_variable("project_dir", self.project_dir);
@@ -149,6 +156,7 @@ impl BuildAction for BuildWheel {
 
         // Set output directory
         build.add_variable("out_dir", "$builddir/wheels/");
+        build.add_variable("wheel_out_dir", "../$builddir/wheels");
 
         // Calculate the wheel filename that uv will generate
         let tag = if let Some(platform) = self.platform {

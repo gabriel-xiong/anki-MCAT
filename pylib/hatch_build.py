@@ -20,7 +20,7 @@ class CustomBuildHook(BuildHookInterface):
         force_include = build_data.setdefault("force_include", {})
 
         # Set platform-specific wheel tag
-        if not (platform_tag := os.environ.get("ANKI_WHEEL_TAG")):
+        if not (platform_tag := (os.environ.get("ANKI_WHEEL_TAG") or "").strip()):
             # On Windows, uv invokes this build hook during the initial uv sync,
             # when the tag has not been declared by our build script.
             return

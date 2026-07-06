@@ -344,6 +344,8 @@ fn build_wheel(build: &mut Build) -> Result<()> {
             version: anki_version(),
             platform: None,
             deps: inputs![
+                // Serialize with wheels:anki — parallel hatchling builds fail on Windows.
+                ":wheels:anki",
                 ":qt:aqt",
                 glob!("qt/aqt/**"),
                 "qt/pyproject.toml",

@@ -40,7 +40,9 @@ question bank is curated offline from named sources.
   (`data/questions.json`, `data/flashcards-dev*.csv`,
   `data/mcat-outline.v1.json`).
 
-See the companion repo's `docs/` (PRD, ARCHITECTURE, DECISIONS,
+See the companion [`MCAT`](https://github.com/gabriel-xiong/MCAT) repo
+(`docs/`: PRD, ARCHITECTURE, DECISIONS, [`BRAINLIFT.md`](https://github.com/gabriel-xiong/MCAT/blob/main/docs/BRAINLIFT.md),
+[`HOW-TO-VERIFY.md`](https://github.com/gabriel-xiong/MCAT/blob/main/docs/HOW-TO-VERIFY.md),
 MASTERY-QUERY-SPEC, PERFORMANCE-MODE-SPEC) for full specs and the decision log.
 
 **Graded MSI handoff (install, launcher, proxy JSON, strict profile):**
